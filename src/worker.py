@@ -1914,6 +1914,106 @@ async def handle_pull_request_review_submitted(payload: dict, env=None) -> None:
     """Track review credits in D1 (first two unique reviewers per PR per month)."""
     await _track_review_in_d1(payload, env)
 
+async def _ensure_label_exists(
+    owner: str, repo: str, name: str, color: str, token: str
+) -> None:
+    """Create a label if it does not already exist, or update its colour."""
+    resp = await github_api(
+        "GET",
+        f"/repos/{owner}/{repo}/labels/{name.replace(' ', '%20')}",
+        token,
+    )
+    if resp.status == 404:
+        await github_api(
+            "POST",
+            f"/repos/{owner}/{repo}/labels",
+            token,
+            {"name": name, "color": color},
+        )
+    elif resp.status == 200:
+        data = json.loads(await resp.text())
+        if data.get("color") != color:
+          await github_api(
+              "PATCH",
+              f"/repos/{owner}/{repo}/labels/{name.replace(' ', '%20')}",
+              token,
+              {"color": color},
+          )
+
+async def handle_pull_request_review(payload: dict, token: str) -> None:
+    """Add/remove 'changes-requested' label based on PR review state."""
+
+    pr = payload["pull_request"]
+    owner = payload["repository"]["owner"]["login"]
+    repo = payload["repository"]["name"]
+    number = pr["number"]
+
+    # Fetch all reviews
+    resp = await github_api(
+        "GET",
+        f"/repos/{owner}/{repo}/pulls/{number}/reviews",
+        token,
+    )
+
+    if resp.status != 200:
+        return
+
+    reviews = json.loads(await resp.text())
+
+    # Track latest state per reviewer
+    reviewer_states = {}
+
+    reviews.sort(key=lambda r: r.get("submitted_at") or "")
+
+    for review in reviews:
+        user = (review.get("user") or {}).get("login")
+        state = review.get("state")
+
+        if not user:
+            continue
+
+        if state not in ("COMMENTED", "PENDING"):
+            reviewer_states[user] = state
+
+    has_changes_requested = any(
+        state == "CHANGES_REQUESTED"
+        for state in reviewer_states.values()
+    )
+
+    label_name = "changes-requested"
+    label_color = "e74c3c"
+
+    # Ensure label exists
+    await _ensure_label_exists(owner, repo, label_name, label_color, token)
+
+    # Get current labels
+    resp = await github_api(
+        "GET",
+        f"/repos/{owner}/{repo}/issues/{number}/labels",
+        token,
+    )
+
+    if resp.status != 200:
+        return
+
+    labels = json.loads(await resp.text())
+    current = {l["name"] for l in labels}
+
+    if has_changes_requested:
+        if label_name not in current:
+            await github_api(
+                "POST",
+                f"/repos/{owner}/{repo}/issues/{number}/labels",
+                token,
+                {"labels": [label_name]},
+            )
+    else:
+        if label_name in current:
+            await github_api(
+                "DELETE",
+                f"/repos/{owner}/{repo}/issues/{number}/labels/{label_name}",
+                token,
+            )
 
 # ---------------------------------------------------------------------------
 # Webhook dispatcher
@@ -1996,8 +2096,11 @@ async def handle_webhook(request, env) -> Response:
                 await handle_pull_request_opened(payload, token, env)
             elif action == "closed":
                 await handle_pull_request_closed(payload, token, env)
-        elif event == "pull_request_review" and action == "submitted":
-            await handle_pull_request_review_submitted(payload, env)
+        elif event == "pull_request_review":
+            if action in ("submitted", "dismissed"):
+                if action == "submitted":
+                  await handle_pull_request_review_submitted(payload, env)
+                await handle_pull_request_review(payload, token)
     except Exception as exc:
         console.error(f"[BLT] Webhook handler error: {exc}")
         return _json({"error": "Internal server error"}, 500)
