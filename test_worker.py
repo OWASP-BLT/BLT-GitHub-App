@@ -602,6 +602,122 @@ class TestHandlePullRequestClosed(unittest.TestCase):
         self.assertEqual(comments, [])
 
 
+class TestHandlePullRequestReview(unittest.TestCase):
+    """handle_pull_request_review — tests PR review state label updating"""
+
+    def _run_review(self, payload, reviews_resp, labels_resp, github_calls, ensure_label_calls):
+        async def _inner():
+            class _StubResponse:
+                def __init__(self, status, text_data):
+                    self.status = status
+                    self._text = text_data
+                async def text(self):
+                    return self._text
+
+            async def _mock_github_api(method, path, token, body=None):
+                github_calls.append((method, path, body))
+                if method == "GET" and path.endswith("/reviews"):
+                    return _StubResponse(reviews_resp[0], json.dumps(reviews_resp[1]))
+                if method == "GET" and path.endswith("/labels"):
+                    return _StubResponse(labels_resp[0], json.dumps(labels_resp[1]))
+                return _StubResponse(200, "[]")
+
+            async def _mock_ensure_label(owner, repo, name, color, token):
+                ensure_label_calls.append((owner, repo, name, color))
+
+            with (
+                patch.object(_worker, "github_api", new=_mock_github_api),
+                patch.object(_worker, "_ensure_label_exists", new=_mock_ensure_label),
+            ):
+                await _worker.handle_pull_request_review(payload, "tok")
+        _run(_inner())
+
+    def test_adds_changes_requested_label(self):
+        payload = _make_pr_payload()
+        reviews = [
+            {"user": {"login": "alice"}, "state": "CHANGES_REQUESTED", "submitted_at": "2023-01-01T00:00:00Z"}
+        ]
+        labels = [{"name": "bug"}]
+        calls = []
+        ensure_calls = []
+        self._run_review(payload, (200, reviews), (200, labels), calls, ensure_calls)
+        
+        # Should call _ensure_label_exists for changes-requested
+        self.assertTrue(any(c[2] == "changes-requested" for c in ensure_calls))
+        # POST to add label
+        self.assertTrue(any(method == "POST" and "labels" in path and body == {"labels": ["changes-requested"]}
+                            for method, path, body in calls))
+
+    def test_removes_changes_requested_label_when_approved(self):
+        payload = _make_pr_payload()
+        reviews = [
+            {"user": {"login": "alice"}, "state": "APPROVED", "submitted_at": "2023-01-01T00:00:00Z"}
+        ]
+        labels = [{"name": "changes-requested"}]
+        calls = []
+        ensure_calls = []
+        self._run_review(payload, (200, reviews), (200, labels), calls, ensure_calls)
+        
+        # DELETE from labels
+        self.assertTrue(any(method == "DELETE" and path.endswith("/labels/changes-requested")
+                            for method, path, body in calls))
+
+    def test_ignores_commented_and_pending_states(self):
+        payload = _make_pr_payload()
+        reviews = [
+            {"user": {"login": "alice"}, "state": "CHANGES_REQUESTED", "submitted_at": "2023-01-01T00:00:00Z"},
+            {"user": {"login": "alice"}, "state": "COMMENTED", "submitted_at": "2023-01-02T00:00:00Z"},
+            {"user": {"login": "alice"}, "state": "PENDING", "submitted_at": "2023-01-03T00:00:00Z"}
+        ]
+        labels = [{"name": "bug"}]
+        calls = []
+        ensure_calls = []
+        self._run_review(payload, (200, reviews), (200, labels), calls, ensure_calls)
+        
+        # Label should be added because last effective state from alice is CHANGES_REQUESTED
+        self.assertTrue(any(method == "POST" and "labels" in path for method, path, body in calls))
+
+    def test_respects_latest_review_state(self):
+        payload = _make_pr_payload()
+        reviews = [
+            {"user": {"login": "alice"}, "state": "CHANGES_REQUESTED", "submitted_at": "2023-01-01T00:00:00Z"},
+            {"user": {"login": "alice"}, "state": "APPROVED", "submitted_at": "2023-01-02T00:00:00Z"}
+        ]
+        labels = [{"name": "changes-requested"}]
+        calls = []
+        ensure_calls = []
+        self._run_review(payload, (200, reviews), (200, labels), calls, ensure_calls)
+        
+        # DELETE because Alice's final state is APPROVED
+        self.assertTrue(any(method == "DELETE" and path.endswith("changes-requested") for method, path, body in calls))
+
+    def test_multiple_reviewers_one_requests_changes(self):
+        payload = _make_pr_payload()
+        reviews = [
+            {"user": {"login": "alice"}, "state": "APPROVED", "submitted_at": "2023-01-01T00:00:00Z"},
+            {"user": {"login": "bob"}, "state": "CHANGES_REQUESTED", "submitted_at": "2023-01-02T00:00:00Z"}
+        ]
+        labels = []
+        calls = []
+        ensure_calls = []
+        self._run_review(payload, (200, reviews), (200, labels), calls, ensure_calls)
+        
+        self.assertTrue(any(method == "POST" and "labels" in path for method, path, body in calls))
+
+    def test_does_nothing_if_label_already_correct(self):
+        payload = _make_pr_payload()
+        reviews = [
+            {"user": {"login": "alice"}, "state": "APPROVED", "submitted_at": "2023-01-01T00:00:00Z"}
+        ]
+        labels = []
+        calls = []
+        ensure_calls = []
+        self._run_review(payload, (200, reviews), (200, labels), calls, ensure_calls)
+        
+        self.assertFalse(any(method == "POST" for method, path, body in calls))
+        self.assertFalse(any(method == "DELETE" for method, path, body in calls))
+
+
 class TestSecretVarsStatusHtml(unittest.TestCase):
     """_secret_vars_status_html and _landing_html secret variable display"""
 
