@@ -1985,7 +1985,7 @@ async def handle_changes_requested_label(owner: str, repo: str, pr_number: int, 
         if label_name in current:
             await github_api(
                 "DELETE",
-                f"/repos/{owner}/{repo}/issues/{number}/labels/{label_name}",
+                f"/repos/{owner}/{repo}/issues/{number}/labels/{quote(label_name, safe='')}",
                 token,
             )
 
