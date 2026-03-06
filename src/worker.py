@@ -494,7 +494,7 @@ def _is_dependabot_dependency_update(pr: dict) -> bool:
 async def handle_dependabot_pr(payload: dict, token: str) -> None:
     """Auto-approve pull requests opened by Dependabot."""
     pr = payload["pull_request"]
-    pr_author = pr["user"]["login"]
+    pr_author = (pr.get("user") or {}).get("login") or "<deleted>"
     owner = payload["repository"]["owner"]["login"]
     repo = payload["repository"]["name"]
     pr_number = pr["number"]
@@ -613,6 +613,8 @@ async def handle_webhook(request, env) -> Response:
         elif event == "pull_request":
             if action == "opened":
                 await handle_pull_request_opened(payload, token)
+                await handle_dependabot_pr(payload, token)
+            elif action in ("synchronize", "reopened"):
                 await handle_dependabot_pr(payload, token)
             elif action == "closed":
                 await handle_pull_request_closed(payload, token)
