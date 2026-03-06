@@ -684,6 +684,39 @@ class TestApplyFilesChangedLabel(unittest.TestCase):
         self.assertEqual(len(label_posts), 1)
         self.assertIn("files-changed: 0", str(label_posts[0][2]))
 
+    def test_paginates_through_multiple_pages(self):
+        """Verify _get_all_pr_files fetches all pages and reports correct count."""
+        page1 = [{"filename": f"file{i}.py"} for i in range(100)]
+        page2 = [{"filename": f"file{i}.py"} for i in range(100, 150)]
+        calls = []
+
+        async def mock_api(method, path, token, body=None):
+            calls.append((method, path, body))
+            if "pulls/" in path and "/files" in path:
+                if "&page=1" in path:
+                    return _MockResponse(200, page1)
+                elif "&page=2" in path:
+                    return _MockResponse(200, page2)
+                else:
+                    return _MockResponse(200, [])
+            if "/labels/" in path and method == "GET":
+                return _MockResponse(404)
+            if "/labels" in path and method in ("GET", "POST", "PATCH", "DELETE"):
+                return _MockResponse(200, [])
+            return _MockResponse(200)
+
+        async def _inner():
+            with patch.object(_worker, "github_api", new=mock_api):
+                await _worker.apply_files_changed_label(
+                    "owner", "repo", {"number": 1}, "tok"
+                )
+        asyncio.run(_inner())
+
+        file_gets = [c for c in calls if "/files?" in c[1]]
+        self.assertEqual(len(file_gets), 2)
+        label_posts = [c for c in calls if c[0] == "POST" and "/issues/1/labels" in c[1]]
+        self.assertIn("files-changed: 150", str(label_posts[0][2]))
+
 
 # ---------------------------------------------------------------------------
 # PR Automation — apply_migration_label
@@ -784,6 +817,33 @@ class TestCheckLinkedIssue(unittest.TestCase):
         self._run(None, comments, calls)
         self.assertEqual(len(comments), 1)
 
+    def test_skips_duplicate_comment(self):
+        """Do not post a warning if the marker comment already exists."""
+        existing_comments = [{"body": "<!-- no-linked-issue -->\n⚠️ **No linked issue detected.**"}]
+        comments_posted = []
+
+        async def mock_api(method, path, token, body=None):
+            if "/issues/1/comments" in path and method == "GET":
+                return _MockResponse(200, existing_comments)
+            if "/labels/" in path and method == "GET":
+                return _MockResponse(404)
+            if "/labels" in path and method == "GET":
+                return _MockResponse(200, [])
+            return _MockResponse(200)
+
+        async def _inner():
+            with (
+                patch.object(_worker, "github_api", new=mock_api),
+                patch.object(_worker, "create_comment", new=AsyncMock(
+                    side_effect=lambda o, r, n, b, t: comments_posted.append(b)
+                )),
+            ):
+                await _worker.check_linked_issue(
+                    "owner", "repo", {"number": 1, "body": "no issue ref"}, "tok"
+                )
+        asyncio.run(_inner())
+        self.assertEqual(comments_posted, [])
+
 
 # ---------------------------------------------------------------------------
 # PR Automation — check_pr_conflicts
@@ -829,6 +889,33 @@ class TestCheckPRConflicts(unittest.TestCase):
         comments, calls = [], []
         self._run(None, comments, calls)
         self.assertEqual(comments, [])
+
+    def test_skips_duplicate_conflict_comment(self):
+        """Do not post a warning if the marker comment already exists."""
+        existing_comments = [{"body": "<!-- conflict-warning -->\n⚠️ **Merge conflicts detected.**"}]
+        comments_posted = []
+
+        async def mock_api(method, path, token, body=None):
+            if "/issues/1/comments" in path and method == "GET":
+                return _MockResponse(200, existing_comments)
+            if "/labels/" in path and method == "GET":
+                return _MockResponse(404)
+            if "/labels" in path and method == "GET":
+                return _MockResponse(200, [])
+            return _MockResponse(200)
+
+        async def _inner():
+            with (
+                patch.object(_worker, "github_api", new=mock_api),
+                patch.object(_worker, "create_comment", new=AsyncMock(
+                    side_effect=lambda o, r, n, b, t: comments_posted.append(b)
+                )),
+            ):
+                await _worker.check_pr_conflicts(
+                    "owner", "repo", {"number": 1, "mergeable": False}, "tok"
+                )
+        asyncio.run(_inner())
+        self.assertEqual(comments_posted, [])
 
 
 # ---------------------------------------------------------------------------
@@ -1657,7 +1744,7 @@ class TestFeatureTogglePROpened(unittest.TestCase):
                     side_effect=lambda *a: label_calls.append("leaderboard")
                 )),
             ):
-                await _worker.handle_pull_request_opened(payload, "tok", features)
+                await _worker.handle_pull_request_opened(payload, "tok", features=features)
         _run(_inner())
 
     def test_welcome_disabled_skips_comment(self):
@@ -1710,7 +1797,7 @@ class TestFeatureTogglePROpened(unittest.TestCase):
                 patch.object(_worker, "_post_or_update_leaderboard", new=AsyncMock()),
             ):
                 features = dict(FEATURE_DEFAULTS, FEATURE_PR_LIMIT=False)
-                await _worker.handle_pull_request_opened(payload, "tok", features)
+                await _worker.handle_pull_request_opened(payload, "tok", features=features)
         _run(_inner())
         self.assertEqual(enforce_calls, [])
 
@@ -1783,7 +1870,7 @@ class TestFeatureTogglePRClosed(unittest.TestCase):
                     side_effect=lambda *a: leaderboard_calls.append("leaderboard")
                 )),
             ):
-                await _worker.handle_pull_request_closed(payload, "tok", features)
+                await _worker.handle_pull_request_closed(payload, "tok", features=features)
         _run(_inner())
 
     def test_merge_comment_disabled(self):
@@ -1830,7 +1917,7 @@ class TestFeatureToggleIssueComment(unittest.TestCase):
                 )),
             ):
                 features = dict(FEATURE_DEFAULTS, FEATURE_LEADERBOARD=False)
-                await _worker.handle_issue_comment(payload, "tok", features)
+                await _worker.handle_issue_comment(payload, "tok", features=features)
         _run(_inner())
         self.assertEqual(leaderboard_calls, [])
 
@@ -1847,7 +1934,7 @@ class TestFeatureToggleIssueComment(unittest.TestCase):
                 )),
             ):
                 features = dict(FEATURE_DEFAULTS)
-                await _worker.handle_issue_comment(payload, "tok", features)
+                await _worker.handle_issue_comment(payload, "tok", features=features)
         _run(_inner())
         self.assertEqual(len(leaderboard_calls), 1)
 
