@@ -24,7 +24,7 @@ import hmac as _hmac
 import json
 import time
 from typing import Optional, Tuple
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 
 from js import Headers, Response, console, fetch  # Cloudflare Workers JS bindings
 from index_template import INDEX_HTML  # Landing page HTML template
@@ -1920,7 +1920,7 @@ async def _ensure_label_exists(
     """Create a label if it does not already exist, or update its colour."""
     resp = await github_api(
         "GET",
-        f"/repos/{owner}/{repo}/labels/{name.replace(' ', '%20')}",
+        f"/repos/{owner}/{repo}/labels/{quote(name, safe='')}",
         token,
     )
     if resp.status == 404:
@@ -1933,12 +1933,12 @@ async def _ensure_label_exists(
     elif resp.status == 200:
         data = json.loads(await resp.text())
         if data.get("color") != color:
-          await github_api(
-              "PATCH",
-              f"/repos/{owner}/{repo}/labels/{name.replace(' ', '%20')}",
-              token,
-              {"color": color},
-          )
+            await github_api(
+                "PATCH",
+                f"/repos/{owner}/{repo}/labels/{quote(name, safe='')}",
+                token,
+                {"color": color},
+            )
 
 async def handle_pull_request_review(payload: dict, token: str) -> None:
     """Add/remove 'changes-requested' label based on PR review state."""
@@ -2099,7 +2099,7 @@ async def handle_webhook(request, env) -> Response:
         elif event == "pull_request_review":
             if action in ("submitted", "dismissed"):
                 if action == "submitted":
-                  await handle_pull_request_review_submitted(payload, env)
+                    await handle_pull_request_review_submitted(payload, env)
                 await handle_pull_request_review(payload, token)
     except Exception as exc:
         console.error(f"[BLT] Webhook handler error: {exc}")
