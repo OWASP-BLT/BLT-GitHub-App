@@ -2011,7 +2011,7 @@ async def handle_pull_request_review(payload: dict, token: str) -> None:
         if label_name in current:
             await github_api(
                 "DELETE",
-                f"/repos/{owner}/{repo}/issues/{number}/labels/{label_name}",
+                f"/repos/{owner}/{repo}/issues/{number}/labels/{quote(label_name, safe='')}",
                 token,
             )
 
