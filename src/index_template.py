@@ -1,3 +1,15 @@
+"""HTML template for the BLT GitHub App landing page.
+
+This is auto-generated from public/index.html.
+Edit public/index.html and regenerate this file before deploying.
+
+Template variables:
+    {{INSTALL_URL}} — GitHub App installation URL
+    {{YEAR}} — Current year for copyright
+    {{SECRET_VARS_STATUS}} — HTML rows showing environment variable status
+"""
+
+INDEX_HTML = """\
 <!DOCTYPE html>
 <html lang="en" class="scroll-smooth">
 <head>
@@ -226,3 +238,4 @@
 
 </body>
 </html>
+"""
