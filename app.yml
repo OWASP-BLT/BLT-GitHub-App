@@ -9,6 +9,7 @@ default_permissions:
   issues: write
   pull_requests: write
   metadata: read
+  contents: read
 default_events:
   - issue_comment
   - issues

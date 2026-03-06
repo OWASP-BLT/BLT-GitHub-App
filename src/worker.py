@@ -23,6 +23,7 @@ import hashlib
 import hmac as _hmac
 import json
 import time
+import re
 from typing import Optional, Tuple
 from urllib.parse import urlparse
 
@@ -39,6 +40,47 @@ LEADERBOARD_COMMAND = "/leaderboard"
 MAX_ASSIGNEES = 1
 ASSIGNMENT_DURATION_HOURS = 8
 BUG_LABELS = {"bug", "vulnerability", "security"}
+
+# PR automation constants
+MAX_OPEN_PRS_PER_AUTHOR = 50
+FILES_CHANGED_COLORS = {
+    0: "cccccc",   # gray
+    1: "0e8a16",   # green
+    2: "fbca04",   # yellow
+    6: "ff9800",   # orange
+    11: "e74c3c",  # red
+}
+ISSUE_LINK_PATTERN = r"(?i)(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s+#\d+"
+MIGRATION_PATH_PATTERN = r"migrations/\d{4}_"
+
+# Feature toggle defaults — all enabled unless explicitly set to "false" in env
+FEATURE_DEFAULTS = {
+    "FEATURE_PR_SIZE_LABEL": True,
+    "FEATURE_MIGRATION_LABEL": True,
+    "FEATURE_ISSUE_LINK_CHECK": False,
+    "FEATURE_CONFLICT_CHECK": True,
+    "FEATURE_PR_LIMIT": True,
+    "FEATURE_WELCOME_COMMENT": True,
+    "FEATURE_BUG_REPORTING": True,
+    "FEATURE_LEADERBOARD": True,
+    "FEATURE_MERGE_COMMENT": True,
+}
+
+
+def get_feature_config(env) -> dict:
+    """Read feature toggles from environment variables.
+
+    Each toggle defaults to True and is only disabled when its env var
+    is explicitly set to the string ``"false"`` (case-insensitive).
+    """
+    config = {}
+    for key, default in FEATURE_DEFAULTS.items():
+        val = getattr(env, key, None)
+        if val is not None and str(val).strip().lower() == "false":
+            config[key] = False
+        else:
+            config[key] = default
+    return config
 
 # DER OID sequence for rsaEncryption (used when wrapping PKCS#1 → PKCS#8)
 _RSA_OID_SEQ = bytes([
@@ -1623,7 +1665,9 @@ async def _check_rank_improvement(owner: str, repo: str, pr_number: int, author_
 # ---------------------------------------------------------------------------
 
 
-async def handle_issue_comment(payload: dict, token: str, env=None) -> None:
+async def handle_issue_comment(payload: dict, token: str, env=None, features: dict | None = None) -> None:
+    if features is None:
+        features = dict(FEATURE_DEFAULTS)
     comment = payload["comment"]
     issue = payload["issue"]
     if not _is_human(comment["user"]):
@@ -1651,7 +1695,7 @@ async def handle_issue_comment(payload: dict, token: str, env=None) -> None:
         await _assign(owner, repo, issue, login, token)
     elif command == UNASSIGN_COMMAND:
         await _unassign(owner, repo, issue, login, token)
-    elif command == LEADERBOARD_COMMAND:
+    elif command == LEADERBOARD_COMMAND and features.get("FEATURE_LEADERBOARD", True):
         console.log(f"[Leaderboard] Command received for {owner}/{repo}#{issue_number} by @{login}")
         # Best effort: remove the triggering command comment to keep threads clean.
         if env is not None and comment_id:
@@ -1765,8 +1809,10 @@ async def _unassign(
 
 
 async def handle_issue_opened(
-    payload: dict, token: str, blt_api_url: str
+    payload: dict, token: str, blt_api_url: str, features: dict | None = None
 ) -> None:
+    if features is None:
+        features = dict(FEATURE_DEFAULTS)
     issue = payload["issue"]
     sender = payload["sender"]
     if not _is_human(sender):
@@ -1775,33 +1821,46 @@ async def handle_issue_opened(
     repo = payload["repository"]["name"]
     labels = [lb["name"].lower() for lb in issue.get("labels", [])]
     is_bug = any(lb in BUG_LABELS for lb in labels)
-    msg = (
-        f"👋 Thanks for opening this issue, @{sender['login']}!\n\n"
-        "Our team will review it shortly. In the meantime:\n"
-        "- If you'd like to work on this issue, comment `/assign` to get assigned.\n"
-        "- Visit [OWASP BLT](https://owaspblt.org) for more information about "
-        "our bug bounty platform.\n"
-    )
-    if is_bug:
-        bug_data = await report_bug_to_blt(blt_api_url, {
+
+    if features.get("FEATURE_WELCOME_COMMENT", True):
+        msg = (
+            f"👋 Thanks for opening this issue, @{sender['login']}!\n\n"
+            "Our team will review it shortly. In the meantime:\n"
+            "- If you'd like to work on this issue, comment `/assign` to get assigned.\n"
+            "- Visit [OWASP BLT](https://owaspblt.org) for more information about "
+            "our bug bounty platform.\n"
+        )
+        if is_bug and features.get("FEATURE_BUG_REPORTING", True):
+            bug_data = await report_bug_to_blt(blt_api_url, {
+                "url": issue["html_url"],
+                "description": issue["title"],
+                "github_url": issue["html_url"],
+                "label": labels[0] if labels else "bug",
+            })
+            if bug_data and bug_data.get("id"):
+                msg += (
+                    "\n🐛 This issue has been automatically reported to "
+                    "[OWASP BLT](https://owaspblt.org) "
+                    f"(Bug ID: #{bug_data['id']}). "
+                    "Thank you for helping improve security!\n"
+                )
+        await create_comment(owner, repo, issue["number"], msg, token)
+    elif is_bug and features.get("FEATURE_BUG_REPORTING", True):
+        await report_bug_to_blt(blt_api_url, {
             "url": issue["html_url"],
             "description": issue["title"],
             "github_url": issue["html_url"],
             "label": labels[0] if labels else "bug",
         })
-        if bug_data and bug_data.get("id"):
-            msg += (
-                "\n🐛 This issue has been automatically reported to "
-                "[OWASP BLT](https://owaspblt.org) "
-                f"(Bug ID: #{bug_data['id']}). "
-                "Thank you for helping improve security!\n"
-            )
-    await create_comment(owner, repo, issue["number"], msg, token)
 
 
 async def handle_issue_labeled(
-    payload: dict, token: str, blt_api_url: str
+    payload: dict, token: str, blt_api_url: str, features: dict | None = None
 ) -> None:
+    if features is None:
+        features = dict(FEATURE_DEFAULTS)
+    if not features.get("FEATURE_BUG_REPORTING", True):
+        return
     issue = payload["issue"]
     label = payload.get("label") or {}
     label_name = label.get("name", "").lower()
@@ -1829,7 +1888,236 @@ async def handle_issue_labeled(
         )
 
 
-async def handle_pull_request_opened(payload: dict, token: str, env=None) -> None:
+# ---------------------------------------------------------------------------
+# PR automation helpers
+# ---------------------------------------------------------------------------
+
+
+def _files_changed_color(count: int) -> str:
+    """Return a hex colour based on the number of changed files."""
+    colour = "cccccc"
+    for threshold in sorted(FILES_CHANGED_COLORS):
+        if count >= threshold:
+            colour = FILES_CHANGED_COLORS[threshold]
+    return colour
+
+
+async def _ensure_label(
+    owner: str, repo: str, name: str, color: str, token: str
+) -> None:
+    """Create a label if it does not already exist, or update its colour."""
+    resp = await github_api(
+        "GET",
+        f"/repos/{owner}/{repo}/labels/{name.replace(' ', '%20')}",
+        token,
+    )
+    if resp.status == 404:
+        await github_api(
+            "POST",
+            f"/repos/{owner}/{repo}/labels",
+            token,
+            {"name": name, "color": color},
+        )
+    elif resp.status == 200:
+        data = json.loads(await resp.text())
+        if data.get("color") != color:
+            await github_api(
+                "PATCH",
+                f"/repos/{owner}/{repo}/labels/{name.replace(' ', '%20')}",
+                token,
+                {"color": color},
+            )
+
+
+async def _set_label(
+    owner: str, repo: str, number: int, name: str, color: str, token: str
+) -> None:
+    """Ensure a label exists and add it to a PR/issue."""
+    await _ensure_label(owner, repo, name, color, token)
+    await github_api(
+        "POST",
+        f"/repos/{owner}/{repo}/issues/{number}/labels",
+        token,
+        {"labels": [name]},
+    )
+
+
+async def _remove_labels_with_prefix(
+    owner: str, repo: str, number: int, prefix: str, token: str
+) -> None:
+    """Remove all labels whose name starts with *prefix* from a PR/issue."""
+    resp = await github_api(
+        "GET", f"/repos/{owner}/{repo}/issues/{number}/labels", token
+    )
+    if resp.status != 200:
+        return
+    labels = json.loads(await resp.text())
+    for lb in labels:
+        if lb["name"].startswith(prefix):
+            await github_api(
+                "DELETE",
+                f"/repos/{owner}/{repo}/issues/{number}/labels/{lb['name'].replace(' ', '%20')}",
+                token,
+            )
+
+
+# ---------------------------------------------------------------------------
+# PR automation handlers
+# ---------------------------------------------------------------------------
+
+
+async def _get_all_pr_files(
+    owner: str, repo: str, pr_number: int, token: str
+) -> list | None:
+    """Fetch all files for a PR, paginating through all pages."""
+    all_files: list = []
+    page = 1
+    while True:
+        resp = await github_api(
+            "GET",
+            f"/repos/{owner}/{repo}/pulls/{pr_number}/files?per_page=100&page={page}",
+            token,
+        )
+        if resp.status != 200:
+            return None
+        batch = json.loads(await resp.text())
+        if not batch:
+            break
+        all_files.extend(batch)
+        if len(batch) < 100:
+            break
+        page += 1
+    return all_files
+
+
+async def apply_files_changed_label(
+    owner: str, repo: str, pr: dict, token: str
+) -> None:
+    """Add a colour-coded 'files-changed: N' label to a pull request."""
+    files = await _get_all_pr_files(owner, repo, pr["number"], token)
+    if files is None:
+        return
+    count = len(files)
+    label_name = f"files-changed: {count}"
+    color = _files_changed_color(count)
+
+    # Remove any existing files-changed label
+    await _remove_labels_with_prefix(owner, repo, pr["number"], "files-changed:", token)
+    await _set_label(owner, repo, pr["number"], label_name, color, token)
+
+
+async def apply_migration_label(
+    owner: str, repo: str, pr: dict, token: str
+) -> None:
+    """Add a 'migration' label if the PR touches Django migration files."""
+    files = await _get_all_pr_files(owner, repo, pr["number"], token)
+    if files is None:
+        return
+    has_migration = any(
+        re.search(MIGRATION_PATH_PATTERN, f.get("filename", ""))
+        for f in files
+    )
+    if has_migration:
+        await _set_label(owner, repo, pr["number"], "migration", "5319e7", token)
+
+
+async def _has_bot_comment(
+    owner: str, repo: str, number: int, marker: str, token: str
+) -> bool:
+    """Return True if the bot has already posted a comment containing *marker*."""
+    resp = await github_api(
+        "GET",
+        f"/repos/{owner}/{repo}/issues/{number}/comments?per_page=100",
+        token,
+    )
+    if resp.status != 200:
+        return False
+    comments = json.loads(await resp.text())
+    return any(marker in (c.get("body") or "") for c in comments)
+
+
+async def check_linked_issue(
+    owner: str, repo: str, pr: dict, token: str
+) -> None:
+    """Warn if the PR body does not reference an issue (e.g. 'Closes #123')."""
+    body = pr.get("body") or ""
+    if re.search(ISSUE_LINK_PATTERN, body):
+        await _set_label(owner, repo, pr["number"], "linked-issue", "0e8a16", token)
+    else:
+        await _remove_labels_with_prefix(owner, repo, pr["number"], "linked-issue", token)
+        marker = "<!-- no-linked-issue -->"
+        if not await _has_bot_comment(owner, repo, pr["number"], marker, token):
+            await create_comment(
+                owner, repo, pr["number"],
+                f"{marker}\n"
+                "⚠️ **No linked issue detected.** Please reference an issue in your PR "
+                "description using a keyword like `Closes #123` or `Fixes #456`.\n\n"
+                "This helps us track which issues are resolved by this PR.",
+                token,
+            )
+
+
+async def check_pr_conflicts(
+    owner: str, repo: str, pr: dict, token: str
+) -> None:
+    """Post a warning comment when a PR has merge conflicts."""
+    mergeable = pr.get("mergeable")
+    if mergeable is False:
+        await _set_label(owner, repo, pr["number"], "has-conflicts", "e74c3c", token)
+        marker = "<!-- conflict-warning -->"
+        if not await _has_bot_comment(owner, repo, pr["number"], marker, token):
+            await create_comment(
+                owner, repo, pr["number"],
+                f"{marker}\n"
+                "⚠️ **Merge conflicts detected.** Please resolve the conflicts "
+                "in this PR so that it can be reviewed and merged.\n\n"
+                "You can resolve conflicts by rebasing on the latest `main` branch:\n"
+                "```bash\ngit fetch origin\ngit rebase origin/main\n```",
+                token,
+            )
+    else:
+        await _remove_labels_with_prefix(owner, repo, pr["number"], "has-conflicts", token)
+
+
+async def enforce_pr_limit(
+    owner: str, repo: str, pr: dict, sender: str, token: str
+) -> bool:
+    """Close the PR with a message if the author exceeds the open-PR limit.
+
+    Returns True if the PR was closed.
+    """
+    resp = await github_api(
+        "GET",
+        f"/repos/{owner}/{repo}/pulls?state=open&per_page=100",
+        token,
+    )
+    if resp.status != 200:
+        return False
+    open_prs = json.loads(await resp.text())
+    author_prs = [p for p in open_prs if (p.get("user") or {}).get("login") == sender]
+    if len(author_prs) > MAX_OPEN_PRS_PER_AUTHOR:
+        await create_comment(
+            owner, repo, pr["number"],
+            f"⚠️ @{sender} You currently have **{len(author_prs)}** open pull requests "
+            f"in this repository, which exceeds the limit of "
+            f"**{MAX_OPEN_PRS_PER_AUTHOR}**.\n\n"
+            "This PR has been automatically closed. Please merge or close some of "
+            "your existing PRs before opening new ones.",
+            token,
+        )
+        await github_api(
+            "PATCH",
+            f"/repos/{owner}/{repo}/pulls/{pr['number']}",
+            token,
+            {"state": "closed"},
+        )
+        return True
+    return False
+
+
+async def handle_pull_request_opened(payload: dict, token: str, env=None, features: dict | None = None) -> None:
+    if features is None:
+        features = dict(FEATURE_DEFAULTS)
     pr = payload["pull_request"]
     sender = payload["sender"]
     if not _is_human(sender):
@@ -1843,37 +2131,69 @@ async def handle_pull_request_opened(payload: dict, token: str, env=None) -> Non
     repo = payload["repository"]["name"]
     pr_number = pr["number"]
     author_login = sender["login"]
-    
-    # Check for too many open PRs and auto-close if needed
-    was_closed = await _check_and_close_excess_prs(owner, repo, pr_number, author_login, token)
-    if was_closed:
-        return  # Stop further processing if auto-closed
+    # Enforce PR-per-author limit first
+    if features.get("FEATURE_PR_LIMIT", True):
+        closed = await enforce_pr_limit(owner, repo, pr, author_login, token)
+        if closed:
+            return
 
     # Track open PR counter in D1.
     await _track_pr_opened_in_d1(payload, env)
-    
-    # Post welcome message
-    body = (
-        f"👋 Thanks for opening this pull request, @{author_login}!\n\n"
-        "**Before your PR is reviewed, please ensure:**\n"
-        "- [ ] Your code follows the project's coding style and guidelines.\n"
-        "- [ ] You have written or updated tests for your changes.\n"
-        "- [ ] The commit messages are clear and descriptive.\n"
-        "- [ ] You have linked any relevant issues (e.g., `Closes #123`).\n\n"
-        "🔍 Our team will review your PR shortly. "
-        "If you have questions, feel free to ask in the comments.\n\n"
-        "🚀 Keep up the great work! — [OWASP BLT](https://owaspblt.org)"
-    )
-    await create_comment(owner, repo, pr_number, body, token)
-    
+
+    if features.get("FEATURE_WELCOME_COMMENT", True):
+        body = (
+            f"\U0001f44b Thanks for opening this pull request, @{author_login}!\n\n"
+            "**Before your PR is reviewed, please ensure:**\n"
+            "- [ ] Your code follows the project's coding style and guidelines.\n"
+            "- [ ] You have written or updated tests for your changes.\n"
+            "- [ ] The commit messages are clear and descriptive.\n"
+            "- [ ] You have linked any relevant issues (e.g., `Closes #123`).\n\n"
+            "\U0001f50d Our team will review your PR shortly. "
+            "If you have questions, feel free to ask in the comments.\n\n"
+            "\U0001f680 Keep up the great work! \u2014 [OWASP BLT](https://owaspblt.org)"
+        )
+        await create_comment(owner, repo, pr_number, body, token)
+
     # Post leaderboard
-    if env is None:
-        await _post_or_update_leaderboard(owner, repo, pr_number, author_login, token)
-    else:
-        await _post_or_update_leaderboard(owner, repo, pr_number, author_login, token, env)
+    if features.get("FEATURE_LEADERBOARD", True):
+        if env is None:
+            await _post_or_update_leaderboard(owner, repo, pr_number, author_login, token)
+        else:
+            await _post_or_update_leaderboard(owner, repo, pr_number, author_login, token, env)
+
+    # Apply automation labels
+    if features.get("FEATURE_PR_SIZE_LABEL", True):
+        await apply_files_changed_label(owner, repo, pr, token)
+    if features.get("FEATURE_MIGRATION_LABEL", True):
+        await apply_migration_label(owner, repo, pr, token)
+    if features.get("FEATURE_ISSUE_LINK_CHECK", True):
+        await check_linked_issue(owner, repo, pr, token)
 
 
-async def handle_pull_request_closed(payload: dict, token: str, env=None) -> None:
+async def handle_pull_request_synchronize(payload: dict, token: str, features: dict | None = None) -> None:
+    """Re-run automation labels when new commits are pushed to a PR."""
+    if features is None:
+        features = dict(FEATURE_DEFAULTS)
+    pr = payload["pull_request"]
+    sender = payload["sender"]
+    if not _is_human(sender):
+        return
+    owner = payload["repository"]["owner"]["login"]
+    repo = payload["repository"]["name"]
+
+    if features.get("FEATURE_PR_SIZE_LABEL", True):
+        await apply_files_changed_label(owner, repo, pr, token)
+    if features.get("FEATURE_MIGRATION_LABEL", True):
+        await apply_migration_label(owner, repo, pr, token)
+    if features.get("FEATURE_ISSUE_LINK_CHECK", True):
+        await check_linked_issue(owner, repo, pr, token)
+    if features.get("FEATURE_CONFLICT_CHECK", True):
+        await check_pr_conflicts(owner, repo, pr, token)
+
+
+async def handle_pull_request_closed(payload: dict, token: str, env=None, features: dict | None = None) -> None:
+    if features is None:
+        features = dict(FEATURE_DEFAULTS)
     pr = payload["pull_request"]
     sender = payload["sender"]
     if not pr.get("merged"):
@@ -1894,20 +2214,23 @@ async def handle_pull_request_closed(payload: dict, token: str, env=None) -> Non
     await _track_pr_closed_in_d1(payload, env)
     
     # Post merge congratulations
-    body = (
-        f"🎉 PR merged! Thanks for your contribution, @{author_login}!\n\n"
-        "Your work is now part of the project. Keep contributing to "
-        "[OWASP BLT](https://owaspblt.org) and help make the web a safer place! 🛡️"
-    )
-    await create_comment(owner, repo, pr_number, body, token)
+    if features.get("FEATURE_MERGE_COMMENT", True):
+        body = (
+            f"🎉 PR merged! Thanks for your contribution, @{author_login}!\n\n"
+            "Your work is now part of the project. Keep contributing to "
+            "[OWASP BLT](https://owaspblt.org) and help make the web a safer place! 🛡️"
+        )
+        await create_comment(owner, repo, pr_number, body, token)
     
-    # Leaderboard display already shows accurate ranking
-    
-    # Post/update leaderboard
-    if env is None:
-        await _post_or_update_leaderboard(owner, repo, pr_number, author_login, token)
-    else:
-        await _post_or_update_leaderboard(owner, repo, pr_number, author_login, token, env)
+    # Post leaderboard (rank improvement check is disabled — shown in leaderboard display instead)
+    if features.get("FEATURE_LEADERBOARD", True):
+        if env is None:
+            await _post_or_update_leaderboard(owner, repo, pr_number, author_login, token)
+        else:
+            await _post_or_update_leaderboard(owner, repo, pr_number, author_login, token, env)
+
+    # Track PR closed/merged in D1
+    await _track_pr_closed_in_d1(payload, env)
 
 
 async def handle_pull_request_review_submitted(payload: dict, env=None) -> None:
@@ -1982,20 +2305,23 @@ async def handle_webhook(request, env) -> Response:
         return _json({"error": "Authentication failed"}, 500)
 
     blt_api_url = getattr(env, "BLT_API_URL", "https://blt-api.owasp-blt.workers.dev")
+    features = get_feature_config(env)
 
     try:
         if event == "issue_comment" and action == "created":
-            await handle_issue_comment(payload, token, env)
+            await handle_issue_comment(payload, token, env, features)
         elif event == "issues":
             if action == "opened":
-                await handle_issue_opened(payload, token, blt_api_url)
+                await handle_issue_opened(payload, token, blt_api_url, features)
             elif action == "labeled":
-                await handle_issue_labeled(payload, token, blt_api_url)
+                await handle_issue_labeled(payload, token, blt_api_url, features)
         elif event == "pull_request":
-            if action == "opened":
-                await handle_pull_request_opened(payload, token, env)
+            if action in ("opened", "reopened"):
+                await handle_pull_request_opened(payload, token, env, features)
+            elif action == "synchronize":
+                await handle_pull_request_synchronize(payload, token, features)
             elif action == "closed":
-                await handle_pull_request_closed(payload, token, env)
+                await handle_pull_request_closed(payload, token, env, features)
         elif event == "pull_request_review" and action == "submitted":
             await handle_pull_request_review_submitted(payload, env)
     except Exception as exc:
