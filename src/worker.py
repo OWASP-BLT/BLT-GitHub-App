@@ -18,6 +18,7 @@ Environment variables / secrets (configure via ``wrangler.toml`` or
 """
 
 import base64
+import calendar
 import hashlib
 import hmac as _hmac
 import json
@@ -410,34 +411,81 @@ def _month_window(month_key: str) -> Tuple[int, int]:
     y = int(year)
     m = int(month)
     start_struct = time.struct_time((y, m, 1, 0, 0, 0, 0, 0, 0))
-    start_ts = int(time.mktime(start_struct))
+    start_ts = int(calendar.timegm(start_struct))
     if m == 12:
         next_struct = time.struct_time((y + 1, 1, 1, 0, 0, 0, 0, 0, 0))
     else:
         next_struct = time.struct_time((y, m + 1, 1, 0, 0, 0, 0, 0, 0))
-    end_ts = int(time.mktime(next_struct)) - 1
+    end_ts = int(calendar.timegm(next_struct)) - 1
     return start_ts, end_ts
 
 
 def _d1_binding(env):
     """Return D1 binding object if configured, otherwise None."""
-    return getattr(env, "LEADERBOARD_DB", None)
+    db = getattr(env, "LEADERBOARD_DB", None) if env else None
+    return db
 
 
 async def _d1_run(db, sql: str, params: tuple = ()):
-    stmt = db.prepare(sql)
-    if params:
-        stmt = stmt.bind(*params)
-    return await stmt.run()
+    try:
+        stmt = db.prepare(sql)
+        if params:
+            stmt = stmt.bind(*params)
+        result = await stmt.run()
+        console.log(f"[D1.run] Executed: {sql[:60]}...")
+        return result
+    except Exception as e:
+        console.error(f"[D1.run] Error executing {sql[:60]}: {e}")
+        raise
+
+
+def _to_py(value):
+    """Best-effort conversion for JS proxy values returned by Workers runtime."""
+    try:
+        from pyodide.ffi import to_py  # noqa: PLC0415 - runtime import
+        return to_py(value)
+    except Exception:
+        return value
 
 
 async def _d1_all(db, sql: str, params: tuple = ()) -> list:
     stmt = db.prepare(sql)
     if params:
         stmt = stmt.bind(*params)
-    result = await stmt.all()
-    rows = result.get("results") if isinstance(result, dict) else None
-    return rows or []
+    raw_result = await stmt.all()
+
+    # Cloudflare D1 returns JS proxy objects at runtime; serialize through JS JSON
+    # first to reliably convert to Python dict/list structures.
+    try:
+        from js import JSON as JS_JSON  # noqa: PLC0415 - runtime import
+        js_json = JS_JSON.stringify(raw_result)
+        parsed = json.loads(str(js_json))
+        rows = parsed.get("results") if isinstance(parsed, dict) else None
+        if isinstance(rows, list):
+            return rows
+    except Exception:
+        pass
+
+    # Fallback path for local tests or non-JS proxy values.
+    result = _to_py(raw_result)
+    rows = None
+    if isinstance(result, dict):
+        rows = result.get("results")
+    if rows is None:
+        try:
+            rows = result.get("results")
+        except Exception:
+            rows = getattr(result, "results", None)
+
+    rows = _to_py(rows)
+    if rows is None:
+        return []
+    if isinstance(rows, list):
+        return rows
+    try:
+        return list(rows)
+    except Exception:
+        return []
 
 
 async def _d1_first(db, sql: str, params: tuple = ()):
@@ -534,34 +582,45 @@ async def _ensure_leaderboard_schema(db) -> None:
 
 async def _d1_inc_open_pr(db, org: str, user_login: str, delta: int) -> None:
     now = int(time.time())
-    await _d1_run(
-        db,
-        """
-        INSERT INTO leaderboard_open_prs (org, user_login, open_prs, updated_at)
-        VALUES (?, ?, ?, ?)
-        ON CONFLICT(org, user_login) DO UPDATE SET
-            open_prs = MAX(0, leaderboard_open_prs.open_prs + excluded.open_prs),
-            updated_at = excluded.updated_at
-        """,
-        (org, user_login, delta, now),
-    )
+    try:
+        result = await _d1_run(
+            db,
+            """
+            INSERT INTO leaderboard_open_prs (org, user_login, open_prs, updated_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(org, user_login) DO UPDATE SET
+                open_prs = CASE
+                    WHEN leaderboard_open_prs.open_prs + excluded.open_prs < 0 THEN 0
+                    ELSE leaderboard_open_prs.open_prs + excluded.open_prs
+                END,
+                updated_at = excluded.updated_at
+            """,
+            (org, user_login, delta, now),
+        )
+        console.log(f"[D1] Inserted/updated open PR count org={org} user={user_login} count={delta}")
+    except Exception as e:
+        console.error(f"[D1] Failed to update open PRs org={org} user={user_login}: {e}")
 
 
 async def _d1_inc_monthly(db, org: str, month_key: str, user_login: str, field: str, delta: int = 1) -> None:
     now = int(time.time())
     if field not in {"merged_prs", "closed_prs", "reviews", "comments"}:
         return
-    await _d1_run(
-        db,
-        f"""
-        INSERT INTO leaderboard_monthly_stats (org, month_key, user_login, {field}, updated_at)
-        VALUES (?, ?, ?, ?, ?)
-        ON CONFLICT(org, month_key, user_login) DO UPDATE SET
-            {field} = leaderboard_monthly_stats.{field} + excluded.{field},
-            updated_at = excluded.updated_at
-        """,
-        (org, month_key, user_login, delta, now),
-    )
+    try:
+        result = await _d1_run(
+            db,
+            f"""
+            INSERT INTO leaderboard_monthly_stats (org, month_key, user_login, {field}, updated_at)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(org, month_key, user_login) DO UPDATE SET
+                {field} = leaderboard_monthly_stats.{field} + excluded.{field},
+                updated_at = excluded.updated_at
+            """,
+            (org, month_key, user_login, delta, now),
+        )
+        console.log(f"[D1] Updated {field} org={org} month={month_key} user={user_login} +{delta}")
+    except Exception as e:
+        console.error(f"[D1] Failed to update {field} org={org} month={month_key} user={user_login}: {e}")
 
 
 async def _track_pr_opened_in_d1(payload: dict, env) -> None:
@@ -689,10 +748,13 @@ async def _track_comment_in_d1(payload: dict, env) -> None:
 async def _track_review_in_d1(payload: dict, env) -> None:
     db = _d1_binding(env)
     if not db:
+        console.log("[D1] REVIEW: No DB binding")
         return
     review = payload.get("review") or {}
     reviewer = review.get("user") or {}
     if _is_bot(reviewer):
+        bot_name = reviewer.get("login", "unknown")
+        console.log(f"[D1] REVIEW: Skipped bot {bot_name}")
         return
     pr = payload.get("pull_request") or {}
     org = (payload.get("repository") or {}).get("owner", {}).get("login", "")
@@ -701,7 +763,10 @@ async def _track_review_in_d1(payload: dict, env) -> None:
     reviewer_login = reviewer.get("login", "")
     submitted_at = review.get("submitted_at")
     if not (org and repo and pr_number and reviewer_login):
+        console.log(f"[D1] REVIEW: Missing fields org={bool(org)} repo={bool(repo)} pr={pr_number} reviewer={reviewer_login}")
         return
+    
+    console.log(f"[D1] REVIEW: Processing {reviewer_login} reviewing {org}/{repo}#{pr_number}")
 
     await _ensure_leaderboard_schema(db)
     mk = _month_key(_parse_github_timestamp(submitted_at) if submitted_at else int(time.time()))
@@ -745,11 +810,19 @@ async def _calculate_leaderboard_stats_from_d1(owner: str, env) -> Optional[dict
     """Read current-month leaderboard stats from D1 if configured."""
     db = _d1_binding(env)
     if not db:
+        console.error("[D1] No D1 binding available")
         return None
 
     await _ensure_leaderboard_schema(db)
     mk = _month_key()
     start_timestamp, end_timestamp = _month_window(mk)
+
+    # DEBUG: Check if there's ANY data in the tables
+    all_monthly = await _d1_all(db, "SELECT COUNT(*) as cnt FROM leaderboard_monthly_stats", ())
+    all_open = await _d1_all(db, "SELECT COUNT(*) as cnt FROM leaderboard_open_prs", ())
+    total_monthly = all_monthly[0].get('cnt') if all_monthly else 0
+    total_open = all_open[0].get('cnt') if all_open else 0
+    console.log(f"[D1] DEBUG: Total rows in DB: monthly_stats={total_monthly}, open_prs={total_open}")
 
     monthly_rows = await _d1_all(
         db,
@@ -769,6 +842,10 @@ async def _calculate_leaderboard_stats_from_d1(owner: str, env) -> Optional[dict
         """,
         (owner,),
     )
+
+    console.log(f"[D1] Queried org={owner} mk={mk}: {len(monthly_rows or [])} monthly, {len(open_rows or [])} open")
+    if not monthly_rows and not open_rows:
+        console.log(f"[D1] WARNING: No D1 data found for org={owner}")
 
     user_stats = {}
 
@@ -835,24 +912,29 @@ async def _get_backfill_state(db, owner: str, month_key: str) -> dict:
 
 
 async def _set_backfill_state(db, owner: str, month_key: str, next_page: int, completed: bool) -> None:
-    await _d1_run(
-        db,
-        """
-        INSERT INTO leaderboard_backfill_state (org, month_key, next_page, completed, updated_at)
-        VALUES (?, ?, ?, ?, ?)
-        ON CONFLICT(org, month_key) DO UPDATE SET
-            next_page = excluded.next_page,
-            completed = excluded.completed,
-            updated_at = excluded.updated_at
-        """,
-        (owner, month_key, next_page, 1 if completed else 0, int(time.time())),
-    )
+    try:
+        await _d1_run(
+            db,
+            """
+            INSERT INTO leaderboard_backfill_state (org, month_key, next_page, completed, updated_at)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(org, month_key) DO UPDATE SET
+                next_page = excluded.next_page,
+                completed = excluded.completed,
+                updated_at = excluded.updated_at
+            """,
+            (owner, month_key, next_page, 1 if completed else 0, int(time.time())),
+        )
+        console.log(f"[Backfill] State updated: org={owner} month={month_key} next_page={next_page} completed={completed}")
+    except Exception as e:
+        console.error(f"[Backfill] Failed to update state: {e}")
 
 
 async def _run_incremental_backfill(owner: str, token: str, env, repos_per_request: int = 5) -> Optional[dict]:
     """Backfill leaderboard data in small chunks and report progress for user-facing notes."""
     db = _d1_binding(env)
     if not db:
+        console.error("[Backfill] No D1 binding available")
         return None
 
     await _ensure_leaderboard_schema(db)
@@ -861,21 +943,26 @@ async def _run_incremental_backfill(owner: str, token: str, env, repos_per_reque
     start_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(start_ts))
 
     state = await _get_backfill_state(db, owner, month_key)
+    console.log(f"[Backfill] Current state: page={state['next_page']}, completed={state['completed']}")
     if state["completed"]:
+        console.log(f"[Backfill] Already completed for {owner}/{month_key}")
         return {"ran": False, "completed": True, "processed": 0, "next_page": state["next_page"]}
 
     page = state["next_page"]
+    console.log(f"[Backfill] Fetching repos page {page} for {owner}")
     repos_resp = await github_api(
         "GET",
         f"/orgs/{owner}/repos?sort=full_name&direction=asc&per_page={repos_per_request}&page={page}",
         token,
     )
     if repos_resp.status != 200:
-        console.error(f"[Leaderboard] Backfill repo page failed for {owner}: status={repos_resp.status}")
+        console.error(f"[Backfill] Failed to fetch repo page {page}: status={repos_resp.status}")
         return {"ran": False, "completed": False, "processed": 0, "next_page": page}
 
     repos = json.loads(await repos_resp.text())
+    console.log(f"[Backfill] Got {len(repos)} repos on page {page}")
     if not repos:
+        console.log(f"[Backfill] No more repos, marking backfill complete")
         await _set_backfill_state(db, owner, month_key, page, True)
         return {"ran": False, "completed": True, "processed": 0, "next_page": page}
 
@@ -884,76 +971,16 @@ async def _run_incremental_backfill(owner: str, token: str, env, repos_per_reque
         repo_name = repo_obj.get("name")
         if not repo_name:
             continue
-
-        already = await _d1_first(
-            db,
-            """
-            SELECT 1 FROM leaderboard_backfill_repo_done
-            WHERE org = ? AND month_key = ? AND repo = ?
-            """,
-            (owner, month_key, repo_name),
-        )
-        if already:
-            continue
-
-        # Open PRs snapshot for this repo.
-        open_resp = await github_api(
-            "GET",
-            f"/repos/{owner}/{repo_name}/pulls?state=open&per_page=100",
-            token,
-        )
-        if open_resp.status == 200:
-            open_prs = json.loads(await open_resp.text())
-            open_by_user = {}
-            for pr in open_prs:
-                user = pr.get("user") or {}
-                if _is_bot(user):
-                    continue
-                login = user.get("login")
-                if login:
-                    open_by_user[login] = open_by_user.get(login, 0) + 1
-            for login, cnt in open_by_user.items():
-                await _d1_inc_open_pr(db, owner, login, cnt)
-
-        # Closed/merged monthly stats for this repo.
-        closed_resp = await github_api(
-            "GET",
-            f"/repos/{owner}/{repo_name}/pulls?state=closed&per_page=100&sort=updated&direction=desc",
-            token,
-        )
-        if closed_resp.status == 200:
-            closed_prs = json.loads(await closed_resp.text())
-            for pr in closed_prs:
-                user = pr.get("user") or {}
-                if _is_bot(user):
-                    continue
-                login = user.get("login")
-                if not login:
-                    continue
-                merged_at = pr.get("merged_at")
-                closed_at = pr.get("closed_at")
-                if merged_at:
-                    merged_ts = _parse_github_timestamp(merged_at)
-                    if start_ts <= merged_ts <= end_ts:
-                        await _d1_inc_monthly(db, owner, month_key, login, "merged_prs", 1)
-                elif closed_at:
-                    closed_ts = _parse_github_timestamp(closed_at)
-                    if start_ts <= closed_ts <= end_ts:
-                        await _d1_inc_monthly(db, owner, month_key, login, "closed_prs", 1)
-
-        await _d1_run(
-            db,
-            """
-            INSERT INTO leaderboard_backfill_repo_done (org, month_key, repo, updated_at)
-            VALUES (?, ?, ?, ?)
-            ON CONFLICT(org, month_key, repo) DO UPDATE SET
-                updated_at = excluded.updated_at
-            """,
-            (owner, month_key, repo_name, int(time.time())),
-        )
-        processed += 1
+        console.log(f"[Backfill] Backfilling repo {owner}/{repo_name}")
+        seeded = await _backfill_repo_month_if_needed(owner, repo_name, token, env, month_key, start_ts, end_ts)
+        if seeded:
+            processed += 1
+            console.log(f"[Backfill] Seeded {owner}/{repo_name} (total processed this run: {processed})")
+        else:
+            console.log(f"[Backfill] Skipped {owner}/{repo_name} (already seeded or failed)")
 
     done = len(repos) < repos_per_request
+    console.log(f"[Backfill] Processed {processed} repos, done={done}")
     await _set_backfill_state(db, owner, month_key, page + 1, done)
     return {
         "ran": True,
@@ -963,6 +990,116 @@ async def _run_incremental_backfill(owner: str, token: str, env, repos_per_reque
         "month_key": month_key,
         "since": start_iso,
     }
+
+
+async def _backfill_repo_month_if_needed(
+    owner: str,
+    repo_name: str,
+    token: str,
+    env,
+    month_key: Optional[str] = None,
+    start_ts: Optional[int] = None,
+    end_ts: Optional[int] = None,
+) -> bool:
+    """Backfill leaderboard stats for one repo once per month. Returns True if newly seeded."""
+    db = _d1_binding(env)
+    if not db:
+        console.error(f"[Backfill] No D1 binding available for {owner}/{repo_name}")
+        return False
+
+    await _ensure_leaderboard_schema(db)
+    mk = month_key or _month_key()
+    if start_ts is None or end_ts is None:
+        start_ts, end_ts = _month_window(mk)
+
+    already = await _d1_first(
+        db,
+        """
+        SELECT 1 FROM leaderboard_backfill_repo_done
+        WHERE org = ? AND month_key = ? AND repo = ?
+        """,
+        (owner, mk, repo_name),
+    )
+    if already:
+        console.log(f"[Backfill] Repo {owner}/{repo_name} already seeded for {mk}")
+        return False
+
+    console.log(f"[Backfill] Starting backfill for {owner}/{repo_name} month={mk}")
+
+    # Open PRs snapshot for this repo.
+    open_resp = await github_api(
+        "GET",
+        f"/repos/{owner}/{repo_name}/pulls?state=open&per_page=100",
+        token,
+    )
+    if open_resp.status == 200:
+        open_prs = json.loads(await open_resp.text())
+        open_by_user = {}
+        for pr in open_prs:
+            user = pr.get("user") or {}
+            if _is_bot(user):
+                continue
+            login = user.get("login")
+            if login:
+                open_by_user[login] = open_by_user.get(login, 0) + 1
+        console.log(f"[Backfill] Found {len(open_prs)} open PRs, {len(open_by_user)} unique users")
+        for login, cnt in open_by_user.items():
+            console.log(f"[Backfill] User {login}: {cnt} open PRs")
+            await _d1_inc_open_pr(db, owner, login, cnt)
+    else:
+        console.error(f"[Backfill] Failed to fetch open PRs: status={open_resp.status}")
+
+    # Closed/merged monthly stats for this repo.
+    closed_resp = await github_api(
+        "GET",
+        f"/repos/{owner}/{repo_name}/pulls?state=closed&per_page=100&sort=updated&direction=desc",
+        token,
+    )
+    if closed_resp.status == 200:
+        closed_prs = json.loads(await closed_resp.text())
+        merged_count = 0
+        closed_count = 0
+        for pr in closed_prs:
+            user = pr.get("user") or {}
+            if _is_bot(user):
+                continue
+            login = user.get("login")
+            if not login:
+                continue
+            merged_at = pr.get("merged_at")
+            closed_at = pr.get("closed_at")
+            if merged_at:
+                merged_ts = _parse_github_timestamp(merged_at)
+                if start_ts <= merged_ts <= end_ts:
+                    console.log(f"[Backfill] User {login}: merged PR (#{pr.get('number')})")
+                    merged_count += 1
+                    await _d1_inc_monthly(db, owner, mk, login, "merged_prs", 1)
+            elif closed_at:
+                closed_ts = _parse_github_timestamp(closed_at)
+                if start_ts <= closed_ts <= end_ts:
+                    console.log(f"[Backfill] User {login}: closed PR (#{pr.get('number')})")
+                    closed_count += 1
+                    await _d1_inc_monthly(db, owner, mk, login, "closed_prs", 1)
+        console.log(f"[Backfill] Found {merged_count} merged, {closed_count} closed PRs in month range")
+    else:
+        console.error(f"[Backfill] Failed to fetch closed PRs: status={closed_resp.status}")
+
+    try:
+        await _d1_run(
+            db,
+            """
+            INSERT INTO leaderboard_backfill_repo_done (org, month_key, repo, updated_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(org, month_key, repo) DO UPDATE SET
+                updated_at = excluded.updated_at
+            """,
+            (owner, mk, repo_name, int(time.time())),
+        )
+        console.log(f"[Backfill] Marked {owner}/{repo_name} as complete for {mk}")
+        return True
+    except Exception as e:
+        console.error(f"[Backfill] Failed to mark repo as done: {e}")
+        return False
 
 
 async def _fetch_org_repos(org: str, token: str, limit: int = 10) -> list:
@@ -1211,7 +1348,7 @@ def _parse_github_timestamp(ts_str: str) -> int:
     if match:
         year, month, day, hour, minute, second = map(int, match.groups())
         dt = time.struct_time((year, month, day, hour, minute, second, 0, 0, 0))
-        return int(time.mktime(dt))
+        return int(calendar.timegm(dt))
     return 0
 
 
@@ -1283,6 +1420,8 @@ def _format_leaderboard_comment(author_login: str, leaderboard_data: dict, owner
 async def _post_or_update_leaderboard(owner: str, repo: str, issue_number: int, author_login: str, token: str, env=None) -> None:
     """Post or update a leaderboard comment on an issue/PR."""
     leaderboard_note = ""
+    
+    console.log(f"[Leaderboard] Starting leaderboard post for {owner}/{repo}#{issue_number} by @{author_login}")
 
     owner_data = None
     is_org = False
@@ -1290,27 +1429,55 @@ async def _post_or_update_leaderboard(owner: str, repo: str, issue_number: int, 
     if owner_resp.status == 200:
         owner_data = json.loads(await owner_resp.text())
         is_org = owner_data.get("type") == "Organization"
+        console.log(f"[Leaderboard] Owner {owner} is_org={is_org}")
+    else:
+        console.error(f"[Leaderboard] Owner lookup failed for {owner}: status={owner_resp.status}")
 
     # Prefer D1-backed stats for accurate and scalable org-wide leaderboard.
     leaderboard_data = await _calculate_leaderboard_stats_from_d1(owner, env)
+    console.log(f"[Leaderboard] Initial D1 data: {bool(leaderboard_data)}, has_users={bool(leaderboard_data and leaderboard_data.get('sorted')) if leaderboard_data else False}")
 
-    # If D1 is configured but currently empty, backfill in small chunks per command run.
-    if leaderboard_data is not None and is_org and not leaderboard_data.get("sorted"):
-        backfill_result = await _run_incremental_backfill(owner, token, env)
-        if backfill_result:
+    # Always prioritize seeding the current repo so requester sees their repo's activity immediately.
+    if leaderboard_data is not None and is_org:
+        console.log(f"[Leaderboard] D1 is available, attempting to seed current repo {owner}/{repo}")
+        seeded_current = await _backfill_repo_month_if_needed(owner, repo, token, env)
+        console.log(f"[Leaderboard] Current repo backfill result: seeded_current={seeded_current}")
+        if seeded_current:
+            console.log(f"[Leaderboard] Seeded current repo {owner}/{repo} for immediate leaderboard accuracy")
             leaderboard_data = await _calculate_leaderboard_stats_from_d1(owner, env) or leaderboard_data
-            if backfill_result.get("completed"):
-                if backfill_result.get("processed", 0) > 0:
-                    leaderboard_note = (
-                        f"Backfill completed in this request; seeded data from {backfill_result.get('processed', 0)} repos."
-                    )
-            elif backfill_result.get("ran"):
-                leaderboard_note = (
-                    f"Backfill is in progress. Seeded {backfill_result.get('processed', 0)} repos in this run. "
-                    "Run `/leaderboard` again to continue filling historical data."
+            console.log(f"[Leaderboard] After current repo seed, data has {len(leaderboard_data.get('sorted', []))} users")
+    else:
+        console.log(f"[Leaderboard] Skipped current repo backfill: leaderboard_data={bool(leaderboard_data)}, is_org={is_org}")
+
+    # Continue backfill until completed, not just when data is empty.
+    if leaderboard_data is not None and is_org:
+        db = _d1_binding(env)
+        if db:
+            month_key = _month_key()
+            state = await _get_backfill_state(db, owner, month_key)
+            if not state.get("completed"):
+                console.log(
+                    f"[Leaderboard] Running incremental backfill for {owner} "
+                    f"month={month_key} page={state.get('next_page')}"
                 )
-            else:
-                leaderboard_note = "Backfill could not run this time; leaderboard will continue updating from new webhook events."
+                backfill_result = await _run_incremental_backfill(owner, token, env)
+                if backfill_result:
+                    leaderboard_data = await _calculate_leaderboard_stats_from_d1(owner, env) or leaderboard_data
+                    console.log(f"[Leaderboard] After incremental backfill, data has {len(leaderboard_data.get('sorted', []))} users")
+                    if backfill_result.get("completed"):
+                        leaderboard_note = (
+                            f"Backfill completed in this request; seeded {backfill_result.get('processed', 0)} repos in the final chunk."
+                        )
+                    elif backfill_result.get("ran"):
+                        leaderboard_note = (
+                            f"Backfill in progress: seeded {backfill_result.get('processed', 0)} repos in this run; "
+                            f"next page {backfill_result.get('next_page', '?')}. "
+                            "Run `/leaderboard` again to continue filling historical data."
+                        )
+                    else:
+                        leaderboard_note = "Backfill did not progress this run; leaderboard still updates from new webhook events."
+                else:
+                    leaderboard_note = "Backfill state unavailable; leaderboard still updates from new webhook events."
 
     # Fallback to API-based calculation when D1 is unavailable.
     if leaderboard_data is None:
@@ -1339,12 +1506,15 @@ async def _post_or_update_leaderboard(owner: str, repo: str, issue_number: int, 
     # Format comment
     comment_body = _format_leaderboard_comment(author_login, leaderboard_data, owner, leaderboard_note)
     
-    # Delete existing leaderboard comment(s), then always create a fresh one.
+    # Delete existing leaderboard comment(s) and old /leaderboard command comments, then create a fresh leaderboard comment.
     resp = await github_api("GET", f"/repos/{owner}/{repo}/issues/{issue_number}/comments?per_page=100", token)
     if resp.status == 200:
         comments = json.loads(await resp.text())
         for c in comments:
-            if c.get("body") and LEADERBOARD_MARKER in c["body"]:
+            body = c.get("body") or ""
+            is_old_board = LEADERBOARD_MARKER in body
+            is_command_comment = _extract_command(body) == LEADERBOARD_COMMAND
+            if is_old_board or is_command_comment:
                 delete_resp = await github_api(
                     "DELETE",
                     f"/repos/{owner}/{repo}/issues/comments/{c['id']}",
@@ -1352,7 +1522,7 @@ async def _post_or_update_leaderboard(owner: str, repo: str, issue_number: int, 
                 )
                 if delete_resp.status not in (204, 200):
                     console.error(
-                        f"[Leaderboard] Failed to delete old leaderboard comment {c['id']} "
+                        f"[Leaderboard] Failed to delete old leaderboard/command comment {c['id']} "
                         f"for {owner}/{repo}#{issue_number}: status={delete_resp.status}"
                     )
     else:
@@ -1527,6 +1697,18 @@ async def handle_issue_comment(payload: dict, token: str, env=None, features: di
         await _unassign(owner, repo, issue, login, token)
     elif command == LEADERBOARD_COMMAND and features.get("FEATURE_LEADERBOARD", True):
         console.log(f"[Leaderboard] Command received for {owner}/{repo}#{issue_number} by @{login}")
+        # Best effort: remove the triggering command comment to keep threads clean.
+        if env is not None and comment_id:
+            delete_cmd_resp = await github_api(
+                "DELETE",
+                f"/repos/{owner}/{repo}/issues/comments/{comment_id}",
+                token,
+            )
+            if delete_cmd_resp.status not in (204, 200):
+                console.error(
+                    f"[Leaderboard] Failed to delete triggering command comment {comment_id} "
+                    f"for {owner}/{repo}#{issue_number}: status={delete_cmd_resp.status}"
+                )
         try:
             if env is None:
                 await _post_or_update_leaderboard(owner, repo, issue_number, login, token)
@@ -2315,7 +2497,7 @@ async def on_fetch(request, env) -> Response:
 # ---------------------------------------------------------------------------
 
 
-async def scheduled(event, env):
+async def _run_scheduled(env):
     """Handle scheduled cron events to check and unassign stale issues.
     
     This runs periodically (configured in wrangler.toml) to find issues that:
@@ -2385,6 +2567,16 @@ async def scheduled(event, env):
         
     except Exception as e:
         console.error(f"[CRON] Error during scheduled task: {e}")
+
+
+async def on_scheduled(controller, env, ctx=None):
+    """Cloudflare Python Workers cron entrypoint."""
+    await _run_scheduled(env)
+
+
+async def scheduled(event, env):
+    """Backward-compatible alias for runtimes expecting scheduled()."""
+    await _run_scheduled(env)
 
 
 async def _check_stale_assignments(owner: str, repo: str, token: str):
