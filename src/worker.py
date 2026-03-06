@@ -1997,7 +1997,7 @@ async def handle_pull_request_review(payload: dict, token: str) -> None:
         return
 
     labels = json.loads(await resp.text())
-    current = {l["name"] for l in labels}
+    current = {label["name"] for label in labels}
 
     if has_changes_requested:
         if label_name not in current:
