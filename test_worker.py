@@ -622,12 +622,13 @@ class TestHandlePullRequestReview(unittest.TestCase):
                     return _StubResponse(labels_resp[0], json.dumps(labels_resp[1]))
                 return _StubResponse(200, "[]")
 
-            async def _mock_ensure_label(owner, repo, name, color, token):
+            async def _mock_ensure_label(owner, repo, name, color, description, token):
                 ensure_label_calls.append((owner, repo, name, color))
 
             with (
                 patch.object(_worker, "github_api", new=_mock_github_api),
-                patch.object(_worker, "_ensure_label_exists", new=_mock_ensure_label),
+                patch.object(_worker, "ensure_label_exists", new=_mock_ensure_label),
+                patch.object(_worker, "check_peer_review_and_comment", new=AsyncMock()),
             ):
                 await _worker.handle_pull_request_review(payload, "tok")
         _run(_inner())

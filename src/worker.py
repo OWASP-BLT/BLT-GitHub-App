@@ -1920,12 +1920,12 @@ async def handle_pull_request_review_submitted(payload: dict, env=None) -> None:
     """Track review credits in D1 (first two unique reviewers per PR per month)."""
     await _track_review_in_d1(payload, env)
 
-async def handle_changes_requested_label(owner: str, repo: str, pr_number: int, token: str) -> None:
+async def handle_changes_requested_label(owner: str, repo: str, number: int, token: str) -> None:
     """Add/remove 'changes-requested' label based on PR review state."""
     # Fetch all reviews
     resp = await github_api(
         "GET",
-        f"/repos/{owner}/{repo}/pulls/{pr_number}/reviews",
+        f"/repos/{owner}/{repo}/pulls/{number}/reviews",
         token,
     )
 
