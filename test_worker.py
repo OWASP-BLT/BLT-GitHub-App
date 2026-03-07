@@ -614,10 +614,16 @@ class TestHandlePullRequestReview(unittest.TestCase):
                 async def text(self):
                     return self._text
 
+            reviews_returned = False
+
             async def _mock_github_api(method, path, token, body=None):
+                nonlocal reviews_returned
                 github_calls.append((method, path, body))
-                if method == "GET" and path.endswith("/reviews"):
-                    return _StubResponse(reviews_resp[0], json.dumps(reviews_resp[1]))
+                if method == "GET" and "/reviews" in path:
+                    if not reviews_returned:
+                        reviews_returned = True
+                        return _StubResponse(reviews_resp[0], json.dumps(reviews_resp[1]))
+                    return _StubResponse(200, "[]")
                 if method == "GET" and path.endswith("/labels"):
                     return _StubResponse(labels_resp[0], json.dumps(labels_resp[1]))
                 return _StubResponse(200, "[]")

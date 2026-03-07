@@ -1922,17 +1922,24 @@ async def handle_pull_request_review_submitted(payload: dict, env=None) -> None:
 
 async def handle_changes_requested_label(owner: str, repo: str, number: int, token: str) -> None:
     """Add/remove 'changes-requested' label based on PR review state."""
-    # Fetch all reviews
-    resp = await github_api(
-        "GET",
-        f"/repos/{owner}/{repo}/pulls/{number}/reviews",
-        token,
-    )
-
-    if resp.status != 200:
-        return
-
-    reviews = json.loads(await resp.text())
+    # Fetch all reviews (paginated)
+    reviews = []
+    page = 1
+    while True:
+        resp = await github_api(
+            "GET",
+            f"/repos/{owner}/{repo}/pulls/{number}/reviews?per_page=100&page={page}",
+            token,
+        )
+        if resp.status != 200:
+            if page == 1:
+                return
+            break
+        page_reviews = json.loads(await resp.text())
+        if not page_reviews:
+            break
+        reviews.extend(page_reviews)
+        page += 1
 
     # Track latest state per reviewer
     reviewer_states = {}
@@ -1957,9 +1964,6 @@ async def handle_changes_requested_label(owner: str, repo: str, number: int, tok
     label_name = "changes-requested"
     label_color = "e74c3c"
 
-    # Ensure label exists
-    await ensure_label_exists(owner, repo, label_name, label_color, "", token)
-
     # Get current labels
     resp = await github_api(
         "GET",
@@ -1974,7 +1978,9 @@ async def handle_changes_requested_label(owner: str, repo: str, number: int, tok
     current = {label["name"] for label in labels}
 
     if has_changes_requested:
+        # Only ensure label exists when we need to add it
         if label_name not in current:
+            await ensure_label_exists(owner, repo, label_name, label_color, "", token)
             await github_api(
                 "POST",
                 f"/repos/{owner}/{repo}/issues/{number}/labels",
