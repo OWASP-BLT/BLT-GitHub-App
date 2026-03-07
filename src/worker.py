@@ -25,7 +25,7 @@ import json
 import re
 import time
 from typing import Optional, Tuple
-from urllib.parse import quote, urlparse
+from urllib.parse import quote as _url_quote, urlparse
 
 from js import Headers, Response, console, fetch  # Cloudflare Workers JS bindings
 from index_template import INDEX_HTML  # Landing page HTML template
@@ -46,6 +46,11 @@ _CONSOLE_JS_EXTENSIONS = (".js", ".ts", ".jsx", ".tsx")
 
 # Regex pattern from check-console-log.yml — matches any console.* call
 _CONSOLE_PATTERN = re.compile(r"console\.[a-zA-Z]+\s*\(")
+
+# Regexes used by _scan_console_statements to strip noise before testing a line
+_BLOCK_COMMENT_RE = re.compile(r"/\*.*?\*/", re.DOTALL)
+_INLINE_COMMENT_RE = re.compile(r"//.*")
+_STRING_LITERAL_RE = re.compile(r'"(?:[^"\\]|\\.)*"|\'(?:[^\'\\]|\\.)*\'|`(?:[^`\\]|\\.)*`')
 
 # DER OID sequence for rsaEncryption (used when wrapping PKCS#1 → PKCS#8)
 _RSA_OID_SEQ = bytes([
