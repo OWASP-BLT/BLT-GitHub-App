@@ -1,4 +1,4 @@
-"""BLT GitHub App — Python Cloudflare Worker.
+﻿"""BLT GitHub App — Python Cloudflare Worker.
 
 Handles GitHub webhooks and serves a landing homepage.
 This is the Python / Cloudflare Workers port of the original Node.js Probot app.
@@ -2376,8 +2376,6 @@ async def run_console_check(owner: str, repo: str, pr_number: int, head_sha: str
         summary = "No `console.*` statements found in changed JS/TS files."
 
     await update_check_run(owner, repo, check_run_id, conclusion, title, summary, annotations, token)
-
-
 async def handle_pull_request_synchronize(payload: dict, token: str, env=None) -> None:
     """Re-run CI checks when new commits are pushed to an open PR."""
     pr = payload.get("pull_request") or {}
