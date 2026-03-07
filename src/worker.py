@@ -1619,6 +1619,193 @@ async def _check_rank_improvement(owner: str, repo: str, pr_number: int, author_
 
 
 # ---------------------------------------------------------------------------
+# PR Summary Comment
+# ---------------------------------------------------------------------------
+
+_PR_SUMMARY_MARKER = "<!-- blt-pr-summary -->"
+
+
+def _pr_size_label(files: int) -> tuple:
+    """Return (label, emoji) based on number of files changed."""
+    if files <= 10:
+        return ("small", "🟢")
+    if files <= 50:
+        return ("medium", "🟡")
+    return ("large", "🔴")
+
+
+def _estimate_pr_points(pr: dict) -> dict:
+    """Estimate points earned for opening and merging a PR based on size."""
+    files = pr.get("changed_files", 0) or 0
+    if files <= 10:
+        multiplier = 1.0
+        size = "small"
+    elif files <= 50:
+        multiplier = 1.5
+        size = "medium"
+    else:
+        multiplier = 2.0
+        size = "large"
+    opened = int(5 * multiplier)
+    merged = int(10 * multiplier)
+    return {
+        "opened": opened,
+        "if_merged": merged,
+        "total_estimate": opened + merged,
+        "size": size,
+        "multiplier": multiplier,
+    }
+
+
+def _has_linked_issue(body: str) -> bool:
+    """Return True if the PR body contains a linked issue reference like 'Closes #123'."""
+    import re
+    if not body:
+        return False
+    return bool(re.search(r"(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s*#\d+", body, re.IGNORECASE))
+
+
+def _build_pr_summary_comment(pr: dict, owner: str, repo: str, leaderboard_data: Optional[dict]) -> str:
+    """Build a formatted PR summary markdown comment."""
+    author_login = (pr.get("user") or {}).get("login", "contributor")
+    files = pr.get("changed_files", 0) or 0
+    additions = pr.get("additions", 0) or 0
+    deletions = pr.get("deletions", 0) or 0
+    pr_number = pr.get("number", "")
+    body_text = pr.get("body") or ""
+
+    size_label, size_emoji = _pr_size_label(files)
+    pts = _estimate_pr_points(pr)
+    has_issue = _has_linked_issue(body_text)
+    issue_check = "✅" if has_issue else "⬜"
+
+    # Leaderboard rank lines (filled in if D1 data available)
+    rank_line = ""
+    points_line = ""
+    milestone_line = ""
+    if leaderboard_data:
+        sorted_users = leaderboard_data.get("sorted") or []
+        user_stats = leaderboard_data.get("users") or {}
+        rank = None
+        for idx, entry in enumerate(sorted_users):
+            if entry.get("login") == author_login:
+                rank = idx + 1
+                break
+        if rank is not None and author_login in user_stats:
+            stats = user_stats[author_login]
+            total = stats.get("total", 0)
+            rank_line = f"\n- **Current Rank**: #{rank} of {len(sorted_users)} this month"
+            points_line = f"\n- **Monthly Points**: {total}"
+            next_m = next((m for m in (100, 250, 500, 1000, 2500, 5000) if total < m), None)
+            if next_m:
+                milestone_line = f"\n- **Next Milestone**: {next_m} pts ({next_m - total} to go!)"
+        else:
+            rank_line = "\n- **Leaderboard**: First PR of the month — open PRs give +1 pt, merged give +10 pt!"
+
+    now_str = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime())
+
+    return f"""{_PR_SUMMARY_MARKER}
+## 🤖 PR Summary — `{owner}/{repo}#{pr_number}`
+
+Hi @{author_login}! Here's a quick overview of your pull request.
+
+### 📊 PR Statistics
+| Metric | Value |
+|--------|-------|
+| **Files Changed** | {files} ({size_emoji} {size_label}) |
+| **Lines Added** | +{additions} |
+| **Lines Deleted** | -{deletions} |
+| **Total Changes** | {additions + deletions} |
+
+### 🏆 Estimated Points
+| Event | Points |
+|-------|--------|
+| PR Opened *(already earned)* | **+{pts['opened']}** |
+| If Merged | **+{pts['if_merged']}** |
+| **Potential Total** | **{pts['total_estimate']}** |
+
+> 📏 Size multiplier: **{pts['multiplier']}×** ({size_label} PR — 1–10 files=1×, 11–50=1.5×, 51+=2×){rank_line}{points_line}{milestone_line}
+
+### ✅ Contributor Checklist
+- {issue_check} Linked issue in description (e.g. `Closes #123`)
+- ⬜ Code follows the project's coding style
+- ⬜ Tests written/updated for changes
+- ⬜ Commit messages are clear and descriptive
+- ⬜ Self-reviewed the diff before requesting review
+
+### 💡 Tips
+- Run `pre-commit run --all-files` locally to auto-fix lint/formatting issues
+- Link an issue with `Closes #<number>` in your PR description to earn extra credit
+- Need AI help? Comment `@coderabbitai help` for an interactive AI review
+- See the [Contributing Guide](https://github.com/{owner}/{repo}/blob/main/CONTRIBUTING.md) for project conventions
+
+---
+*Updated: {now_str} · Powered by [OWASP BLT](https://owaspblt.org)*"""
+
+
+async def _post_or_update_pr_summary(
+    owner: str,
+    repo: str,
+    pr_number: int,
+    token: str,
+    pr: dict,
+    env=None,
+) -> None:
+    """Post a PR summary comment, or update the existing one in place."""
+    leaderboard_data = None
+    if env is not None:
+        try:
+            leaderboard_data = await _calculate_leaderboard_stats_from_d1(owner, env)
+        except Exception as exc:
+            console.error(f"[BLT] PR summary: leaderboard fetch failed: {exc}")
+
+    new_body = _build_pr_summary_comment(pr, owner, repo, leaderboard_data)
+
+    # Try to find and update an existing BLT summary comment.
+    resp = await github_api(
+        "GET",
+        f"/repos/{owner}/{repo}/issues/{pr_number}/comments?per_page=100",
+        token,
+    )
+    if resp.status == 200:
+        comments = json.loads(await resp.text())
+        for c in comments:
+            if _PR_SUMMARY_MARKER in (c.get("body") or ""):
+                update_resp = await github_api(
+                    "PATCH",
+                    f"/repos/{owner}/{repo}/issues/comments/{c['id']}",
+                    token,
+                    {"body": new_body},
+                )
+                if update_resp.status in (200, 201):
+                    console.log(f"[BLT] PR summary updated for {owner}/{repo}#{pr_number}")
+                else:
+                    err = await update_resp.text()
+                    console.error(f"[BLT] PR summary update failed: status={update_resp.status} body={err[:200]}")
+                return
+
+    # No existing summary comment — create a fresh one.
+    await create_comment(owner, repo, pr_number, new_body, token)
+    console.log(f"[BLT] PR summary posted for {owner}/{repo}#{pr_number}")
+
+
+async def handle_pull_request_synchronize(payload: dict, token: str, env=None) -> None:
+    """Update the PR summary when new commits are pushed to an open PR."""
+    pr = payload.get("pull_request") or {}
+    sender = payload.get("sender") or {}
+    if not _is_human(sender) or _is_bot(sender):
+        return
+
+    owner = (payload.get("repository") or {}).get("owner", {}).get("login", "")
+    repo = (payload.get("repository") or {}).get("name", "")
+    pr_number = pr.get("number")
+    if not (owner and repo and pr_number):
+        return
+
+    await _post_or_update_pr_summary(owner, repo, pr_number, token, pr, env)
+
+
+# ---------------------------------------------------------------------------
 # Event handlers — mirror the Node.js handler logic exactly
 # ---------------------------------------------------------------------------
 
@@ -1851,21 +2038,10 @@ async def handle_pull_request_opened(payload: dict, token: str, env=None) -> Non
 
     # Track open PR counter in D1.
     await _track_pr_opened_in_d1(payload, env)
-    
-    # Post welcome message
-    body = (
-        f"👋 Thanks for opening this pull request, @{author_login}!\n\n"
-        "**Before your PR is reviewed, please ensure:**\n"
-        "- [ ] Your code follows the project's coding style and guidelines.\n"
-        "- [ ] You have written or updated tests for your changes.\n"
-        "- [ ] The commit messages are clear and descriptive.\n"
-        "- [ ] You have linked any relevant issues (e.g., `Closes #123`).\n\n"
-        "🔍 Our team will review your PR shortly. "
-        "If you have questions, feel free to ask in the comments.\n\n"
-        "🚀 Keep up the great work! — [OWASP BLT](https://owaspblt.org)"
-    )
-    await create_comment(owner, repo, pr_number, body, token)
-    
+
+    # Post PR summary comment (stats, checklist, estimated points, leaderboard rank).
+    await _post_or_update_pr_summary(owner, repo, pr_number, token, pr, env)
+
     # Post leaderboard
     if env is None:
         await _post_or_update_leaderboard(owner, repo, pr_number, author_login, token)
@@ -1994,6 +2170,8 @@ async def handle_webhook(request, env) -> Response:
         elif event == "pull_request":
             if action == "opened":
                 await handle_pull_request_opened(payload, token, env)
+            elif action == "synchronize":
+                await handle_pull_request_synchronize(payload, token, env)
             elif action == "closed":
                 await handle_pull_request_closed(payload, token, env)
         elif event == "pull_request_review" and action == "submitted":

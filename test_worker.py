@@ -552,16 +552,28 @@ class TestHandlePullRequestOpened(unittest.TestCase):
             with patch.object(_worker, "create_comment", new=AsyncMock(side_effect=lambda o, r, n, b, t: comments.append(b))):
                 with patch.object(_worker, "_check_and_close_excess_prs", new=AsyncMock(return_value=False)):
                     with patch.object(_worker, "_post_or_update_leaderboard", new=AsyncMock()):
-                        await _worker.handle_pull_request_opened(payload, "tok")
+                        with patch.object(_worker, "_post_or_update_pr_summary", new=AsyncMock()):
+                            await _worker.handle_pull_request_opened(payload, "tok")
         _run(_inner())
 
     def test_posts_welcome_message(self):
+        # The welcome message is now delivered via the PR summary comment.
+        # Verify that _post_or_update_pr_summary is called (not a plain create_comment).
         payload = _make_pr_payload()
-        comments = []
-        self._run_opened(payload, comments)
-        self.assertEqual(len(comments), 1)
-        self.assertIn("Thanks for opening this pull request", comments[0])
-        self.assertIn("OWASP BLT", comments[0])
+        summary_calls = []
+
+        async def _inner():
+            async def _mock_summary(owner, repo, pr_number, token, pr, env=None):
+                summary_calls.append(pr_number)
+
+            with patch.object(_worker, "_post_or_update_pr_summary", side_effect=_mock_summary):
+                with patch.object(_worker, "_check_and_close_excess_prs", new=AsyncMock(return_value=False)):
+                    with patch.object(_worker, "_post_or_update_leaderboard", new=AsyncMock()):
+                        with patch.object(_worker, "_track_pr_opened_in_d1", new=AsyncMock()):
+                            with patch.object(_worker, "console", new=types.SimpleNamespace(error=lambda *a: None, log=lambda *a: None)):
+                                await _worker.handle_pull_request_opened(payload, "tok")
+        _run(_inner())
+        self.assertEqual(summary_calls, [1])  # PR #1 from _make_pr_payload
 
     def test_ignores_bot_senders(self):
         payload = _make_pr_payload(sender={"login": "bot", "type": "Bot"})
@@ -968,28 +980,30 @@ class TestHandlePullRequestOpenedLeaderboard(unittest.TestCase):
         async def _inner():
             async def _mock_leaderboard(owner, repo, number, login, token):
                 leaderboard_calls.append((owner, repo, number, login))
-            
+
             async def _mock_close(owner, repo, pr_number, author_login, token):
                 close_calls.append((owner, repo, pr_number, author_login))
                 return False  # Not closed
-            
+
             with patch.object(_worker, "_post_or_update_leaderboard", new=_mock_leaderboard):
                 with patch.object(_worker, "_check_and_close_excess_prs", new=_mock_close):
                     with patch.object(_worker, "create_comment", new=AsyncMock(side_effect=lambda o, r, n, b, t: comment_calls.append(b))):
-                        await _worker.handle_pull_request_opened(payload, "tok")
+                        with patch.object(_worker, "_post_or_update_pr_summary", new=AsyncMock()):
+                            await _worker.handle_pull_request_opened(payload, "tok")
         _run(_inner())
 
     def test_posts_leaderboard_on_pr_open(self):
         payload = _make_pr_payload()
         leaderboard_calls, close_calls, comments = [], [], []
         self._run_pr_opened(payload, leaderboard_calls, close_calls, comments)
-        
+
         # Should check for excess PRs
         self.assertEqual(len(close_calls), 1)
         # Should post leaderboard
         self.assertEqual(len(leaderboard_calls), 1)
-        # Should post welcome comment
-        self.assertTrue(any("Thanks for opening this pull request" in c for c in comments))
+        # PR summary is posted via _post_or_update_pr_summary (mocked above), not create_comment
+        # so no raw create_comment calls are expected
+        self.assertEqual(len(comments), 0)
 
     def test_skips_bots(self):
         payload = _make_pr_payload(sender={"login": "dependabot", "type": "Bot"})
@@ -1531,6 +1545,429 @@ class TestTrackingOperations(unittest.TestCase):
 
     def test_track_comment(self):
         _run(self._test_track_comment())
+
+
+# ---------------------------------------------------------------------------
+# PR Summary Comment tests
+# ---------------------------------------------------------------------------
+
+class TestPrSizeLabel(unittest.TestCase):
+    def test_small_pr(self):
+        label, emoji = _worker._pr_size_label(5)
+        self.assertEqual(label, "small")
+        self.assertEqual(emoji, "🟢")
+
+    def test_boundary_small(self):
+        label, _ = _worker._pr_size_label(10)
+        self.assertEqual(label, "small")
+
+    def test_medium_pr(self):
+        label, emoji = _worker._pr_size_label(25)
+        self.assertEqual(label, "medium")
+        self.assertEqual(emoji, "🟡")
+
+    def test_boundary_medium(self):
+        label, _ = _worker._pr_size_label(50)
+        self.assertEqual(label, "medium")
+
+    def test_large_pr(self):
+        label, emoji = _worker._pr_size_label(51)
+        self.assertEqual(label, "large")
+        self.assertEqual(emoji, "🔴")
+
+    def test_zero_files(self):
+        label, _ = _worker._pr_size_label(0)
+        self.assertEqual(label, "small")
+
+
+class TestEstimatePrPoints(unittest.TestCase):
+    def test_small_pr_points(self):
+        pr = {"changed_files": 5, "additions": 20, "deletions": 10}
+        pts = _worker._estimate_pr_points(pr)
+        self.assertEqual(pts["opened"], 5)   # 5 * 1.0
+        self.assertEqual(pts["if_merged"], 10)  # 10 * 1.0
+        self.assertEqual(pts["total_estimate"], 15)
+        self.assertEqual(pts["size"], "small")
+        self.assertEqual(pts["multiplier"], 1.0)
+
+    def test_medium_pr_points(self):
+        pr = {"changed_files": 20, "additions": 100, "deletions": 50}
+        pts = _worker._estimate_pr_points(pr)
+        self.assertEqual(pts["opened"], 7)   # int(5 * 1.5)
+        self.assertEqual(pts["if_merged"], 15)  # int(10 * 1.5)
+        self.assertEqual(pts["size"], "medium")
+        self.assertEqual(pts["multiplier"], 1.5)
+
+    def test_large_pr_points(self):
+        pr = {"changed_files": 100, "additions": 500, "deletions": 200}
+        pts = _worker._estimate_pr_points(pr)
+        self.assertEqual(pts["opened"], 10)  # int(5 * 2.0)
+        self.assertEqual(pts["if_merged"], 20)  # int(10 * 2.0)
+        self.assertEqual(pts["size"], "large")
+        self.assertEqual(pts["multiplier"], 2.0)
+
+    def test_missing_fields_default_to_zero(self):
+        pr = {}
+        pts = _worker._estimate_pr_points(pr)
+        self.assertEqual(pts["size"], "small")
+        self.assertIsInstance(pts["opened"], int)
+
+    def test_boundary_10_files(self):
+        pts = _worker._estimate_pr_points({"changed_files": 10})
+        self.assertEqual(pts["size"], "small")
+
+    def test_boundary_50_files(self):
+        pts = _worker._estimate_pr_points({"changed_files": 50})
+        self.assertEqual(pts["size"], "medium")
+
+    def test_boundary_51_files(self):
+        pts = _worker._estimate_pr_points({"changed_files": 51})
+        self.assertEqual(pts["size"], "large")
+
+
+class TestHasLinkedIssue(unittest.TestCase):
+    def test_closes_keyword(self):
+        self.assertTrue(_worker._has_linked_issue("Closes #123"))
+
+    def test_fix_keyword(self):
+        self.assertTrue(_worker._has_linked_issue("fix #42"))
+
+    def test_fixes_keyword(self):
+        self.assertTrue(_worker._has_linked_issue("Fixes #99"))
+
+    def test_resolve_keyword(self):
+        self.assertTrue(_worker._has_linked_issue("Resolves #7"))
+
+    def test_case_insensitive(self):
+        self.assertTrue(_worker._has_linked_issue("CLOSES #1"))
+
+    def test_no_issue_link(self):
+        self.assertFalse(_worker._has_linked_issue("Just a regular PR description."))
+
+    def test_empty_body(self):
+        self.assertFalse(_worker._has_linked_issue(""))
+
+    def test_none_body(self):
+        self.assertFalse(_worker._has_linked_issue(None))
+
+    def test_partial_keyword_no_match(self):
+        # "close" without a #number should not match
+        self.assertFalse(_worker._has_linked_issue("close the loop"))
+
+
+class TestBuildPrSummaryComment(unittest.TestCase):
+    def _make_pr(self, files=5, additions=50, deletions=10, body="Closes #10", number=42, login="alice"):
+        return {
+            "number": number,
+            "user": {"login": login, "type": "User"},
+            "changed_files": files,
+            "additions": additions,
+            "deletions": deletions,
+            "body": body,
+        }
+
+    def test_contains_marker(self):
+        pr = self._make_pr()
+        comment = _worker._build_pr_summary_comment(pr, "OWASP-BLT", "BLT", None)
+        self.assertIn(_worker._PR_SUMMARY_MARKER, comment)
+
+    def test_contains_author_mention(self):
+        pr = self._make_pr(login="bob")
+        comment = _worker._build_pr_summary_comment(pr, "OWASP-BLT", "BLT", None)
+        self.assertIn("@bob", comment)
+
+    def test_contains_pr_number(self):
+        pr = self._make_pr(number=99)
+        comment = _worker._build_pr_summary_comment(pr, "OWASP-BLT", "BLT", None)
+        self.assertIn("#99", comment)
+
+    def test_linked_issue_check_passed(self):
+        pr = self._make_pr(body="Closes #10")
+        comment = _worker._build_pr_summary_comment(pr, "OWASP-BLT", "BLT", None)
+        # Should show ✅ for linked issue
+        self.assertIn("✅", comment)
+
+    def test_no_linked_issue_shows_unchecked(self):
+        pr = self._make_pr(body="No issue reference here")
+        comment = _worker._build_pr_summary_comment(pr, "OWASP-BLT", "BLT", None)
+        lines = comment.split("\n")
+        issue_line = next((l for l in lines if "Linked issue" in l), None)
+        self.assertIsNotNone(issue_line)
+        self.assertIn("⬜", issue_line)
+
+    def test_shows_files_and_lines(self):
+        pr = self._make_pr(files=7, additions=80, deletions=20)
+        comment = _worker._build_pr_summary_comment(pr, "OWASP-BLT", "BLT", None)
+        self.assertIn("7", comment)
+        self.assertIn("+80", comment)
+        self.assertIn("-20", comment)
+
+    def test_shows_size_label(self):
+        pr = self._make_pr(files=5)
+        comment = _worker._build_pr_summary_comment(pr, "OWASP-BLT", "BLT", None)
+        self.assertIn("small", comment)
+
+    def test_shows_large_pr(self):
+        pr = self._make_pr(files=100)
+        comment = _worker._build_pr_summary_comment(pr, "OWASP-BLT", "BLT", None)
+        self.assertIn("large", comment)
+
+    def test_leaderboard_rank_shown_when_data_available(self):
+        pr = self._make_pr(login="carol")
+        lb_data = {
+            "sorted": [{"login": "carol", "total": 25}],
+            "users": {"carol": {"total": 25, "openPrs": 1, "mergedPrs": 1}},
+        }
+        comment = _worker._build_pr_summary_comment(pr, "OWASP-BLT", "BLT", lb_data)
+        self.assertIn("#1", comment)
+        self.assertIn("25", comment)
+
+    def test_leaderboard_not_on_board_message(self):
+        pr = self._make_pr(login="newbie")
+        lb_data = {
+            "sorted": [{"login": "carol", "total": 25}],
+            "users": {"carol": {"total": 25}},
+        }
+        comment = _worker._build_pr_summary_comment(pr, "OWASP-BLT", "BLT", lb_data)
+        self.assertIn("First PR of the month", comment)
+
+    def test_milestone_shown_when_below_cap(self):
+        pr = self._make_pr(login="dan")
+        lb_data = {
+            "sorted": [{"login": "dan", "total": 50}],
+            "users": {"dan": {"total": 50, "openPrs": 2}},
+        }
+        comment = _worker._build_pr_summary_comment(pr, "OWASP-BLT", "BLT", lb_data)
+        self.assertIn("Next Milestone", comment)
+
+    def test_no_leaderboard_data(self):
+        pr = self._make_pr()
+        comment = _worker._build_pr_summary_comment(pr, "OWASP-BLT", "BLT", None)
+        # Should still build without errors
+        self.assertIn(_worker._PR_SUMMARY_MARKER, comment)
+        self.assertNotIn("Current Rank", comment)
+
+
+class TestPostOrUpdatePrSummary(unittest.TestCase):
+    """Test _post_or_update_pr_summary: updates existing comment or creates new."""
+
+    def _make_pr(self):
+        return {
+            "number": 55,
+            "user": {"login": "eve", "type": "User"},
+            "changed_files": 3,
+            "additions": 15,
+            "deletions": 5,
+            "body": "Fixes #88",
+        }
+
+    async def _test_creates_new_when_no_existing(self):
+        pr = self._make_pr()
+        comments_resp = AsyncMock()
+        comments_resp.status = 200
+        comments_resp.text = AsyncMock(return_value=json.dumps([]))
+
+        created_bodies = []
+
+        async def mock_github_api(method, path, token, body=None):
+            if method == "GET" and "comments" in path:
+                return comments_resp
+            if method == "POST" and "comments" in path:
+                created_bodies.append(body.get("body", "") if body else "")
+                r = AsyncMock()
+                r.status = 201
+                return r
+            r = AsyncMock()
+            r.status = 200
+            return r
+
+        with patch.object(_worker, "github_api", side_effect=mock_github_api), \
+             patch.object(_worker, "console", new=types.SimpleNamespace(error=lambda *a: None, log=lambda *a: None)):
+            await _worker._post_or_update_pr_summary("OWASP-BLT", "BLT", 55, "tok", pr, None)
+
+        self.assertEqual(len(created_bodies), 1)
+        self.assertIn(_worker._PR_SUMMARY_MARKER, created_bodies[0])
+
+    async def _test_updates_existing_comment(self):
+        pr = self._make_pr()
+        existing_comment = {
+            "id": 999,
+            "body": _worker._PR_SUMMARY_MARKER + "\nOld content",
+        }
+        comments_resp = AsyncMock()
+        comments_resp.status = 200
+        comments_resp.text = AsyncMock(return_value=json.dumps([existing_comment]))
+
+        patched_bodies = []
+
+        async def mock_github_api(method, path, token, body=None):
+            if method == "GET" and "comments" in path:
+                return comments_resp
+            if method == "PATCH" and "comments/999" in path:
+                patched_bodies.append(body.get("body", "") if body else "")
+                r = AsyncMock()
+                r.status = 200
+                return r
+            r = AsyncMock()
+            r.status = 200
+            return r
+
+        with patch.object(_worker, "github_api", side_effect=mock_github_api), \
+             patch.object(_worker, "console", new=types.SimpleNamespace(error=lambda *a: None, log=lambda *a: None)):
+            await _worker._post_or_update_pr_summary("OWASP-BLT", "BLT", 55, "tok", pr, None)
+
+        self.assertEqual(len(patched_bodies), 1)
+        self.assertIn(_worker._PR_SUMMARY_MARKER, patched_bodies[0])
+
+    async def _test_skips_when_comments_api_fails(self):
+        """If fetching comments fails, should still attempt to create new comment."""
+        pr = self._make_pr()
+        fail_resp = AsyncMock()
+        fail_resp.status = 500
+
+        created = []
+
+        async def mock_github_api(method, path, token, body=None):
+            if method == "GET":
+                return fail_resp
+            if method == "POST":
+                created.append(True)
+                r = AsyncMock()
+                r.status = 201
+                return r
+            r = AsyncMock()
+            r.status = 200
+            return r
+
+        with patch.object(_worker, "github_api", side_effect=mock_github_api), \
+             patch.object(_worker, "console", new=types.SimpleNamespace(error=lambda *a: None, log=lambda *a: None)):
+            await _worker._post_or_update_pr_summary("OWASP-BLT", "BLT", 55, "tok", pr, None)
+
+        self.assertEqual(len(created), 1)
+
+    def test_creates_new_when_no_existing(self):
+        _run(self._test_creates_new_when_no_existing())
+
+    def test_updates_existing_comment(self):
+        _run(self._test_updates_existing_comment())
+
+    def test_skips_when_comments_api_fails(self):
+        _run(self._test_skips_when_comments_api_fails())
+
+
+class TestHandlePullRequestSynchronize(unittest.TestCase):
+    """Test the synchronize event handler."""
+
+    async def _test_calls_post_or_update(self):
+        payload = {
+            "action": "synchronize",
+            "repository": {"owner": {"login": "OWASP-BLT"}, "name": "BLT"},
+            "sender": {"login": "frank", "type": "User"},
+            "pull_request": {
+                "number": 77,
+                "user": {"login": "frank", "type": "User"},
+                "changed_files": 4,
+                "additions": 30,
+                "deletions": 10,
+                "body": "Closes #50",
+            },
+        }
+        called_with = []
+
+        async def mock_post_or_update(owner, repo, pr_number, token, pr, env=None):
+            called_with.append((owner, repo, pr_number))
+
+        with patch.object(_worker, "_post_or_update_pr_summary", side_effect=mock_post_or_update):
+            await _worker.handle_pull_request_synchronize(payload, "tok", None)
+
+        self.assertEqual(called_with, [("OWASP-BLT", "BLT", 77)])
+
+    async def _test_skips_bot_sender(self):
+        payload = {
+            "repository": {"owner": {"login": "OWASP-BLT"}, "name": "BLT"},
+            "sender": {"login": "dependabot[bot]", "type": "Bot"},
+            "pull_request": {"number": 1},
+        }
+        called = []
+
+        async def mock_post_or_update(*args, **kwargs):
+            called.append(True)
+
+        with patch.object(_worker, "_post_or_update_pr_summary", side_effect=mock_post_or_update):
+            await _worker.handle_pull_request_synchronize(payload, "tok", None)
+
+        self.assertEqual(called, [])
+
+    async def _test_skips_missing_fields(self):
+        payload = {
+            "repository": {"owner": {"login": ""}, "name": ""},
+            "sender": {"login": "alice", "type": "User"},
+            "pull_request": {"number": None},
+        }
+        called = []
+
+        async def mock_post_or_update(*args, **kwargs):
+            called.append(True)
+
+        with patch.object(_worker, "_post_or_update_pr_summary", side_effect=mock_post_or_update):
+            await _worker.handle_pull_request_synchronize(payload, "tok", None)
+
+        self.assertEqual(called, [])
+
+    def test_calls_post_or_update(self):
+        _run(self._test_calls_post_or_update())
+
+    def test_skips_bot_sender(self):
+        _run(self._test_skips_bot_sender())
+
+    def test_skips_missing_fields(self):
+        _run(self._test_skips_missing_fields())
+
+
+class TestHandlePullRequestOpenedWithSummary(unittest.TestCase):
+    """Verify handle_pull_request_opened now calls PR summary."""
+
+    async def _test_summary_called_on_pr_opened(self):
+        payload = {
+            "action": "opened",
+            "repository": {"owner": {"login": "OWASP-BLT"}, "name": "BLT"},
+            "sender": {"login": "grace", "type": "User"},
+            "pull_request": {
+                "number": 101,
+                "user": {"login": "grace", "type": "User"},
+                "changed_files": 3,
+                "additions": 20,
+                "deletions": 5,
+                "body": "Closes #200",
+            },
+            "installation": {"id": 42},
+        }
+
+        summary_called = []
+
+        async def mock_summary(owner, repo, pr_number, token, pr, env=None):
+            summary_called.append(pr_number)
+
+        async def mock_check_close(*args, **kwargs):
+            return False  # not closed
+
+        async def mock_track(*args, **kwargs):
+            pass
+
+        async def mock_leaderboard(*args, **kwargs):
+            pass
+
+        with patch.object(_worker, "_post_or_update_pr_summary", side_effect=mock_summary), \
+             patch.object(_worker, "_check_and_close_excess_prs", side_effect=mock_check_close), \
+             patch.object(_worker, "_track_pr_opened_in_d1", side_effect=mock_track), \
+             patch.object(_worker, "_post_or_update_leaderboard", side_effect=mock_leaderboard), \
+             patch.object(_worker, "console", new=types.SimpleNamespace(error=lambda *a: None, log=lambda *a: None)):
+            await _worker.handle_pull_request_opened(payload, "tok", None)
+
+        self.assertIn(101, summary_called)
+
+    def test_summary_called_on_pr_opened(self):
+        _run(self._test_summary_called_on_pr_opened())
 
 
 if __name__ == "__main__":
