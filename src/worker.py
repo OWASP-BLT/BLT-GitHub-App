@@ -2073,24 +2073,31 @@ async def run_console_check(owner: str, repo: str, pr_number: int, head_sha: str
         # Checks API likely not permitted (missing checks:write scope) — skip silently
         return
 
-    # Fetch list of files changed in the PR
-    files_resp = await github_api(
-        "GET",
-        f"/repos/{owner}/{repo}/pulls/{pr_number}/files?per_page=100",
-        token,
-    )
-    if files_resp.status != 200:
-        await update_check_run(
-            owner, repo, check_run_id,
-            "neutral",
-            "Console Statement Check — skipped",
-            "Could not fetch the list of files changed in this PR.",
-            [],
+    # Fetch all files changed in the PR, paginating until no further pages
+    all_pr_files: list = []
+    page = 1
+    while True:
+        files_resp = await github_api(
+            "GET",
+            f"/repos/{owner}/{repo}/pulls/{pr_number}/files?per_page=100&page={page}",
             token,
         )
-        return
-
-    pr_files = json.loads(await files_resp.text())
+        if files_resp.status != 200:
+            await update_check_run(
+                owner, repo, check_run_id,
+                "neutral",
+                "Console Statement Check — skipped",
+                "Could not fetch the list of files changed in this PR.",
+                [],
+                token,
+            )
+            return
+        page_files = json.loads(await files_resp.text())
+        all_pr_files.extend(page_files)
+        if len(page_files) < 100:
+            break
+        page += 1
+    pr_files = all_pr_files
 
     # Filter to JS/TS files that are added or modified (not removed)
     js_files = [
@@ -2103,20 +2110,29 @@ async def run_console_check(owner: str, repo: str, pr_number: int, head_sha: str
 
     all_annotations = []
     scanned = 0
+    skipped = 0
     for file_info in js_files:
         filename = file_info.get("filename", "")
         content_resp = await github_api(
             "GET",
-            f"/repos/{owner}/{repo}/contents/{_url_quote(filename, safe='')}?ref={head_sha}",
+            # safe='/' preserves path separators; spaces/# and other special chars are encoded
+            f"/repos/{owner}/{repo}/contents/{_url_quote(filename, safe='/')}?ref={head_sha}",
             token,
         )
         if content_resp.status != 200:
+            skipped += 1
             continue
         data = json.loads(await content_resp.text())
+        encoding = data.get("encoding", "base64")
         raw_b64 = data.get("content", "")
+        # Skip files that GitHub couldn't inline (e.g. >1 MB returns encoding="none")
+        if not raw_b64 or encoding != "base64":
+            skipped += 1
+            continue
         try:
             content = base64.b64decode(raw_b64.replace("\n", "")).decode("utf-8", errors="replace")
         except Exception:
+            skipped += 1
             continue
         all_annotations.extend(_scan_console_statements(content, filename))
         scanned += 1
@@ -2138,6 +2154,11 @@ async def run_console_check(owner: str, repo: str, pr_number: int, head_sha: str
                 f"\n\n⚠️ Only the first 20 of {total_js_files} JS/TS files were scanned "
                 "(Worker subrequest limit). Additional violations may exist in unscanned files."
             )
+        if skipped:
+            summary += (
+                f"\n\n⚠️ {skipped} file(s) could not be read (too large or unsupported encoding) "
+                "and were skipped."
+            )
     elif total_js_files > 20:
         conclusion = "neutral"
         title = "Console Statement Check — partial scan ⚠️"
@@ -2145,6 +2166,18 @@ async def run_console_check(owner: str, repo: str, pr_number: int, head_sha: str
             f"Only the first 20 of **{total_js_files}** JS/TS files were scanned "
             "(Cloudflare Worker subrequest limit). No violations were found in the scanned "
             "files, but the remaining files were not checked — please review them manually."
+        )
+        if skipped:
+            summary += (
+                f"\n\n⚠️ {skipped} file(s) could not be read (too large or unsupported encoding) "
+                "and were skipped."
+            )
+    elif skipped:
+        conclusion = "neutral"
+        title = "Console Statement Check — partial scan ⚠️"
+        summary = (
+            f"{skipped} JS/TS file(s) could not be read (too large or unsupported encoding) "
+            f"and were skipped. No violations were found in the {scanned} readable {file_word}."
         )
     else:
         conclusion = "success"
