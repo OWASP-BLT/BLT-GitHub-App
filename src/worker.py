@@ -25,7 +25,7 @@ import json
 import re
 import time
 from typing import Optional, Tuple
-from urllib.parse import urlparse
+from urllib.parse import quote as _url_quote, urlparse
 
 from js import Headers, Response, console, fetch  # Cloudflare Workers JS bindings
 from index_template import INDEX_HTML  # Landing page HTML template
@@ -46,6 +46,11 @@ _CONSOLE_JS_EXTENSIONS = (".js", ".ts", ".jsx", ".tsx")
 
 # Regex pattern from check-console-log.yml — matches any console.* call
 _CONSOLE_PATTERN = re.compile(r"console\.[a-zA-Z]+\s*\(")
+
+# Regexes used by _scan_console_statements to strip noise before testing a line
+_BLOCK_COMMENT_RE = re.compile(r"/\*.*?\*/", re.DOTALL)
+_INLINE_COMMENT_RE = re.compile(r"//.*")
+_STRING_LITERAL_RE = re.compile(r'"(?:[^"\\]|\\.)*"|\'(?:[^\'\\]|\\.)*\'|`(?:[^`\\]|\\.)*`')
 
 # DER OID sequence for rsaEncryption (used when wrapping PKCS#1 → PKCS#8)
 _RSA_OID_SEQ = bytes([
@@ -2020,16 +2025,28 @@ async def update_check_run(
 def _scan_console_statements(content: str, filename: str) -> list:
     """Scan file content for console.* calls and return GitHub Check annotation dicts.
 
-    Skips lines that are obviously single-line comments (// or *) to reduce
-    false positives from commented-out code.
+    Strips block comments (preserving newlines so line numbers stay accurate),
+    neutralises string literals, and removes inline comment tails before
+    running _CONSOLE_PATTERN to avoid false positives from commented-out or
+    string-embedded console calls.
     """
+    # Replace block comment bodies with spaces, preserving each newline so that
+    # line numbers in annotations remain accurate after splitting.
+    def _blank_block_comment(m: re.Match) -> str:
+        return re.sub(r"[^\n]", " ", m.group(0))
+    content = _BLOCK_COMMENT_RE.sub(_blank_block_comment, content)
+
     annotations = []
     for line_no, line in enumerate(content.splitlines(), start=1):
         stripped = line.lstrip()
-        # Skip comment lines
+        # Skip lines that are entirely single-line or block-comment leaders
         if stripped.startswith("//") or stripped.startswith("*"):
             continue
-        if _CONSOLE_PATTERN.search(line):
+        # Neutralise string literals first, then strip inline comment tail so
+        # that console.* inside a string or after // is not flagged.
+        cleaned = _STRING_LITERAL_RE.sub("", stripped)
+        cleaned = _INLINE_COMMENT_RE.sub("", cleaned)
+        if _CONSOLE_PATTERN.search(cleaned):
             preview = stripped[:120]
             annotations.append({
                 "path": filename,
@@ -2081,6 +2098,7 @@ async def run_console_check(owner: str, repo: str, pr_number: int, head_sha: str
         if any(f.get("filename", "").endswith(ext) for ext in _CONSOLE_JS_EXTENSIONS)
         and f.get("status") != "removed"
     ]
+    total_js_files = len(js_files)
     js_files = js_files[:20]  # Cap to stay within Cloudflare subrequest budget
 
     all_annotations = []
@@ -2089,7 +2107,7 @@ async def run_console_check(owner: str, repo: str, pr_number: int, head_sha: str
         filename = file_info.get("filename", "")
         content_resp = await github_api(
             "GET",
-            f"/repos/{owner}/{repo}/contents/{filename}?ref={head_sha}",
+            f"/repos/{owner}/{repo}/contents/{_url_quote(filename, safe='')}?ref={head_sha}",
             token,
         )
         if content_resp.status != 200:
@@ -2114,6 +2132,19 @@ async def run_console_check(owner: str, repo: str, pr_number: int, head_sha: str
             f"Found **{issue_count}** `console.*` call{plural} across {scanned} JS/TS {file_word}.\n\n"
             "Remove all `console.*` statements before merging. "
             "Use structured logging or remove debug output entirely."
+        )
+        if total_js_files > 20:
+            summary += (
+                f"\n\n⚠️ Only the first 20 of {total_js_files} JS/TS files were scanned "
+                "(Worker subrequest limit). Additional violations may exist in unscanned files."
+            )
+    elif total_js_files > 20:
+        conclusion = "neutral"
+        title = "Console Statement Check — partial scan ⚠️"
+        summary = (
+            f"Only the first 20 of **{total_js_files}** JS/TS files were scanned "
+            "(Cloudflare Worker subrequest limit). No violations were found in the scanned "
+            "files, but the remaining files were not checked — please review them manually."
         )
     else:
         conclusion = "success"
