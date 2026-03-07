@@ -1932,9 +1932,8 @@ async def handle_changes_requested_label(owner: str, repo: str, number: int, tok
             token,
         )
         if resp.status != 200:
-            if page == 1:
-                return
-            break
+            console.error(f"[BLT] Failed to fetch reviews page {page} for PR #{number}: {resp.status}")
+            return
         page_reviews = json.loads(await resp.text())
         if not page_reviews:
             break
