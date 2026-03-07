@@ -1533,5 +1533,559 @@ class TestTrackingOperations(unittest.TestCase):
         _run(self._test_track_comment())
 
 
+# ---------------------------------------------------------------------------
+# GitHub Checks API + Console Statement Check tests
+# ---------------------------------------------------------------------------
+
+class TestScanConsoleStatements(unittest.TestCase):
+    """Unit tests for _scan_console_statements (pure function, no I/O)."""
+
+    def test_detects_console_log(self):
+        content = "function foo() {\n  console.log('hello');\n}\n"
+        annotations = _worker._scan_console_statements(content, "src/app.js")
+        self.assertEqual(len(annotations), 1)
+        self.assertEqual(annotations[0]["start_line"], 2)
+        self.assertEqual(annotations[0]["path"], "src/app.js")
+        self.assertEqual(annotations[0]["annotation_level"], "failure")
+
+    def test_detects_console_error(self):
+        content = "console.error('oops');\n"
+        annotations = _worker._scan_console_statements(content, "utils.js")
+        self.assertEqual(len(annotations), 1)
+        self.assertIn("console.error", annotations[0]["message"])
+
+    def test_detects_console_warn(self):
+        content = "  console.warn('deprecated');\n"
+        annotations = _worker._scan_console_statements(content, "lib.ts")
+        self.assertEqual(len(annotations), 1)
+
+    def test_multiple_occurrences(self):
+        content = "console.log('a');\nconsole.log('b');\nconsole.log('c');\n"
+        annotations = _worker._scan_console_statements(content, "x.js")
+        self.assertEqual(len(annotations), 3)
+
+    def test_no_console_statements(self):
+        content = "function add(a, b) { return a + b; }\n"
+        annotations = _worker._scan_console_statements(content, "math.js")
+        self.assertEqual(len(annotations), 0)
+
+    def test_skips_single_line_comments(self):
+        content = "// console.log('debug');\nconst x = 1;\n"
+        annotations = _worker._scan_console_statements(content, "app.js")
+        self.assertEqual(len(annotations), 0)
+
+    def test_skips_block_comment_lines(self):
+        content = "/*\n * console.log removed\n */\n"
+        annotations = _worker._scan_console_statements(content, "app.js")
+        self.assertEqual(len(annotations), 0)
+
+    def test_empty_file(self):
+        annotations = _worker._scan_console_statements("", "empty.js")
+        self.assertEqual(len(annotations), 0)
+
+    def test_annotation_fields_complete(self):
+        content = "console.log('test');\n"
+        ann = _worker._scan_console_statements(content, "a.js")[0]
+        self.assertIn("path", ann)
+        self.assertIn("start_line", ann)
+        self.assertIn("end_line", ann)
+        self.assertIn("annotation_level", ann)
+        self.assertIn("title", ann)
+        self.assertIn("message", ann)
+        self.assertEqual(ann["start_line"], ann["end_line"])
+
+    def test_preview_truncated_long_line(self):
+        long_line = "console.log('" + "x" * 200 + "');\n"
+        ann = _worker._scan_console_statements(long_line, "a.js")[0]
+        self.assertLessEqual(len(ann["message"]), 300)  # message stays bounded
+
+    def test_correct_line_numbers(self):
+        content = "const a = 1;\nconst b = 2;\nconsole.log(a + b);\nconst c = 3;\n"
+        annotations = _worker._scan_console_statements(content, "a.js")
+        self.assertEqual(len(annotations), 1)
+        self.assertEqual(annotations[0]["start_line"], 3)
+
+
+class TestCreateCheckRun(unittest.TestCase):
+    """Test create_check_run returns id on success and 0 on failure."""
+
+    async def _test_creates_and_returns_id(self):
+        response_body = {"id": 12345, "name": "Console Statement Check"}
+
+        async def mock_api(method, path, token, body=None):
+            r = AsyncMock()
+            r.status = 201
+            r.text = AsyncMock(return_value=json.dumps(response_body))
+            return r
+
+        with patch.object(_worker, "github_api", side_effect=mock_api), \
+             patch.object(_worker, "console", new=types.SimpleNamespace(error=lambda *a: None, log=lambda *a: None)):
+            run_id = await _worker.create_check_run("OWASP-BLT", "BLT", "Console Statement Check", "abc123", "tok")
+
+        self.assertEqual(run_id, 12345)
+
+    async def _test_returns_zero_on_failure(self):
+        async def mock_api(method, path, token, body=None):
+            r = AsyncMock()
+            r.status = 422
+            r.text = AsyncMock(return_value='{"message":"Unprocessable"}')
+            return r
+
+        with patch.object(_worker, "github_api", side_effect=mock_api), \
+             patch.object(_worker, "console", new=types.SimpleNamespace(error=lambda *a: None, log=lambda *a: None)):
+            run_id = await _worker.create_check_run("OWASP-BLT", "BLT", "Console Statement Check", "abc123", "tok")
+
+        self.assertEqual(run_id, 0)
+
+    def test_creates_and_returns_id(self):
+        _run(self._test_creates_and_returns_id())
+
+    def test_returns_zero_on_failure(self):
+        _run(self._test_returns_zero_on_failure())
+
+
+class TestUpdateCheckRun(unittest.TestCase):
+    """Test update_check_run sends correct PATCH payload."""
+
+    async def _test_sends_patch(self):
+        patched_bodies = []
+
+        async def mock_api(method, path, token, body=None):
+            if method == "PATCH":
+                patched_bodies.append(body)
+            r = AsyncMock()
+            r.status = 200
+            r.text = AsyncMock(return_value="{}")
+            return r
+
+        annotations = [{"path": "a.js", "start_line": 1, "end_line": 1,
+                        "annotation_level": "failure", "title": "t", "message": "m"}]
+
+        with patch.object(_worker, "github_api", side_effect=mock_api), \
+             patch.object(_worker, "console", new=types.SimpleNamespace(error=lambda *a: None, log=lambda *a: None)):
+            await _worker.update_check_run(
+                "OWASP-BLT", "BLT", 99, "failure", "Title", "Summary", annotations, "tok"
+            )
+
+        self.assertEqual(len(patched_bodies), 1)
+        b = patched_bodies[0]
+        self.assertEqual(b["status"], "completed")
+        self.assertEqual(b["conclusion"], "failure")
+        self.assertEqual(b["output"]["title"], "Title")
+        self.assertEqual(b["output"]["summary"], "Summary")
+        self.assertEqual(len(b["output"]["annotations"]), 1)
+
+    async def _test_caps_annotations_at_50(self):
+        patched_bodies = []
+
+        async def mock_api(method, path, token, body=None):
+            patched_bodies.append(body)
+            r = AsyncMock()
+            r.status = 200
+            r.text = AsyncMock(return_value="{}")
+            return r
+
+        many = [{"path": "a.js", "start_line": i, "end_line": i,
+                 "annotation_level": "failure", "title": "t", "message": "m"}
+                for i in range(1, 80)]
+
+        with patch.object(_worker, "github_api", side_effect=mock_api), \
+             patch.object(_worker, "console", new=types.SimpleNamespace(error=lambda *a: None, log=lambda *a: None)):
+            await _worker.update_check_run(
+                "OWASP-BLT", "BLT", 1, "failure", "T", "S", many, "tok"
+            )
+
+        self.assertEqual(len(patched_bodies[0]["output"]["annotations"]), 50)
+
+    async def _test_success_conclusion_on_zero_annotations(self):
+        patched_bodies = []
+
+        async def mock_api(method, path, token, body=None):
+            patched_bodies.append(body)
+            r = AsyncMock()
+            r.status = 200
+            r.text = AsyncMock(return_value="{}")
+            return r
+
+        with patch.object(_worker, "github_api", side_effect=mock_api), \
+             patch.object(_worker, "console", new=types.SimpleNamespace(error=lambda *a: None, log=lambda *a: None)):
+            await _worker.update_check_run(
+                "OWASP-BLT", "BLT", 2, "success", "All good", "No issues", [], "tok"
+            )
+
+        self.assertEqual(patched_bodies[0]["conclusion"], "success")
+        self.assertEqual(patched_bodies[0]["output"]["annotations"], [])
+
+    def test_sends_patch(self):
+        _run(self._test_sends_patch())
+
+    def test_caps_annotations_at_50(self):
+        _run(self._test_caps_annotations_at_50())
+
+    def test_success_conclusion_on_zero_annotations(self):
+        _run(self._test_success_conclusion_on_zero_annotations())
+
+
+class TestRunConsoleCheck(unittest.TestCase):
+    """Integration-style tests for run_console_check."""
+
+    def _make_file_entry(self, filename, status="modified"):
+        return {"filename": filename, "status": status}
+
+    async def _test_full_flow_with_violations(self):
+        """Violations found → check run created, updated with failure."""
+        created = []
+        updated = []
+
+        async def mock_create(owner, repo, name, sha, token):
+            created.append(name)
+            return 42
+
+        async def mock_update(owner, repo, run_id, conclusion, title, summary, annotations, token):
+            updated.append({"conclusion": conclusion, "count": len(annotations)})
+
+        files_resp = AsyncMock()
+        files_resp.status = 200
+        files_resp.text = AsyncMock(return_value=json.dumps([
+            self._make_file_entry("src/app.js")
+        ]))
+
+        content_b64 = __import__("base64").b64encode(b"console.log('debug');\n").decode()
+        file_resp = AsyncMock()
+        file_resp.status = 200
+        file_resp.text = AsyncMock(return_value=json.dumps({"content": content_b64}))
+
+        call_count = 0
+
+        async def mock_api(method, path, token, body=None):
+            nonlocal call_count
+            call_count += 1
+            if "pulls" in path and "files" in path:
+                return files_resp
+            return file_resp
+
+        with patch.object(_worker, "create_check_run", side_effect=mock_create), \
+             patch.object(_worker, "update_check_run", side_effect=mock_update), \
+             patch.object(_worker, "github_api", side_effect=mock_api), \
+             patch.object(_worker, "console", new=types.SimpleNamespace(error=lambda *a: None, log=lambda *a: None)):
+            await _worker.run_console_check("OWASP-BLT", "BLT", 1, "abc123", "tok")
+
+        self.assertEqual(created, ["Console Statement Check"])
+        self.assertEqual(len(updated), 1)
+        self.assertEqual(updated[0]["conclusion"], "failure")
+        self.assertGreater(updated[0]["count"], 0)
+
+    async def _test_full_flow_no_violations(self):
+        """No violations → conclusion is success."""
+        updated = []
+
+        async def mock_create(*args, **kwargs):
+            return 99
+
+        async def mock_update(owner, repo, run_id, conclusion, title, summary, annotations, token):
+            updated.append(conclusion)
+
+        async def mock_api(method, path, token, body=None):
+            if "files" in path:
+                r = AsyncMock()
+                r.status = 200
+                r.text = AsyncMock(return_value=json.dumps([
+                    {"filename": "src/utils.js", "status": "modified"}
+                ]))
+                return r
+            # file content — no console calls
+            content_b64 = __import__("base64").b64encode(b"const x = 1;\n").decode()
+            r = AsyncMock()
+            r.status = 200
+            r.text = AsyncMock(return_value=json.dumps({"content": content_b64}))
+            return r
+
+        with patch.object(_worker, "create_check_run", side_effect=mock_create), \
+             patch.object(_worker, "update_check_run", side_effect=mock_update), \
+             patch.object(_worker, "github_api", side_effect=mock_api), \
+             patch.object(_worker, "console", new=types.SimpleNamespace(error=lambda *a: None, log=lambda *a: None)):
+            await _worker.run_console_check("OWASP-BLT", "BLT", 2, "def456", "tok")
+
+        self.assertEqual(updated, ["success"])
+
+    async def _test_skips_when_check_run_creation_fails(self):
+        """If create_check_run returns 0, nothing else is called."""
+        api_calls = []
+
+        async def mock_create(*args, **kwargs):
+            return 0  # failure
+
+        async def mock_api(*args, **kwargs):
+            api_calls.append(True)
+            r = AsyncMock()
+            r.status = 200
+            r.text = AsyncMock(return_value="[]")
+            return r
+
+        with patch.object(_worker, "create_check_run", side_effect=mock_create), \
+             patch.object(_worker, "github_api", side_effect=mock_api):
+            await _worker.run_console_check("OWASP-BLT", "BLT", 3, "sha", "tok")
+
+        self.assertEqual(api_calls, [])
+
+    async def _test_skips_removed_files(self):
+        """Removed files should not be scanned."""
+        updated = []
+
+        async def mock_create(*args, **kwargs):
+            return 5
+
+        async def mock_update(owner, repo, run_id, conclusion, title, summary, annotations, token):
+            updated.append(conclusion)
+
+        async def mock_api(method, path, token, body=None):
+            if "files" in path:
+                r = AsyncMock()
+                r.status = 200
+                r.text = AsyncMock(return_value=json.dumps([
+                    {"filename": "deleted.js", "status": "removed"}
+                ]))
+                return r
+            r = AsyncMock()
+            r.status = 200
+            r.text = AsyncMock(return_value=json.dumps({"content": ""}))
+            return r
+
+        with patch.object(_worker, "create_check_run", side_effect=mock_create), \
+             patch.object(_worker, "update_check_run", side_effect=mock_update), \
+             patch.object(_worker, "github_api", side_effect=mock_api), \
+             patch.object(_worker, "console", new=types.SimpleNamespace(error=lambda *a: None, log=lambda *a: None)):
+            await _worker.run_console_check("OWASP-BLT", "BLT", 4, "sha", "tok")
+
+        # No JS files scanned → success
+        self.assertEqual(updated, ["success"])
+
+    async def _test_ignores_non_js_files(self):
+        """Python/markdown files should not be scanned."""
+        updated = []
+
+        async def mock_create(*args, **kwargs):
+            return 7
+
+        async def mock_update(owner, repo, run_id, conclusion, title, summary, annotations, token):
+            updated.append(conclusion)
+
+        async def mock_api(method, path, token, body=None):
+            if "files" in path:
+                r = AsyncMock()
+                r.status = 200
+                r.text = AsyncMock(return_value=json.dumps([
+                    {"filename": "worker.py", "status": "modified"},
+                    {"filename": "README.md", "status": "modified"},
+                ]))
+                return r
+            r = AsyncMock()
+            r.status = 200
+            r.text = AsyncMock(return_value="{}")
+            return r
+
+        with patch.object(_worker, "create_check_run", side_effect=mock_create), \
+             patch.object(_worker, "update_check_run", side_effect=mock_update), \
+             patch.object(_worker, "github_api", side_effect=mock_api), \
+             patch.object(_worker, "console", new=types.SimpleNamespace(error=lambda *a: None, log=lambda *a: None)):
+            await _worker.run_console_check("OWASP-BLT", "BLT", 5, "sha", "tok")
+
+        self.assertEqual(updated, ["success"])
+
+    async def _test_neutral_when_files_api_fails(self):
+        """If the files API fails, update check run as neutral."""
+        updated = []
+
+        async def mock_create(*args, **kwargs):
+            return 8
+
+        async def mock_update(owner, repo, run_id, conclusion, title, summary, annotations, token):
+            updated.append(conclusion)
+
+        async def mock_api(method, path, token, body=None):
+            r = AsyncMock()
+            r.status = 500
+            r.text = AsyncMock(return_value="{}")
+            return r
+
+        with patch.object(_worker, "create_check_run", side_effect=mock_create), \
+             patch.object(_worker, "update_check_run", side_effect=mock_update), \
+             patch.object(_worker, "github_api", side_effect=mock_api), \
+             patch.object(_worker, "console", new=types.SimpleNamespace(error=lambda *a: None, log=lambda *a: None)):
+            await _worker.run_console_check("OWASP-BLT", "BLT", 6, "sha", "tok")
+
+        self.assertEqual(updated, ["neutral"])
+
+    def test_full_flow_with_violations(self):
+        _run(self._test_full_flow_with_violations())
+
+    def test_full_flow_no_violations(self):
+        _run(self._test_full_flow_no_violations())
+
+    def test_skips_when_check_run_creation_fails(self):
+        _run(self._test_skips_when_check_run_creation_fails())
+
+    def test_skips_removed_files(self):
+        _run(self._test_skips_removed_files())
+
+    def test_ignores_non_js_files(self):
+        _run(self._test_ignores_non_js_files())
+
+    def test_neutral_when_files_api_fails(self):
+        _run(self._test_neutral_when_files_api_fails())
+
+
+class TestHandlePullRequestSynchronize(unittest.TestCase):
+    """Test pull_request.synchronize routes to console check."""
+
+    async def _test_calls_console_check(self):
+        payload = {
+            "action": "synchronize",
+            "repository": {"owner": {"login": "OWASP-BLT"}, "name": "BLT"},
+            "sender": {"login": "alice", "type": "User"},
+            "pull_request": {
+                "number": 55,
+                "head": {"sha": "abc999"},
+            },
+        }
+        called = []
+
+        async def mock_check(owner, repo, pr_number, head_sha, token):
+            called.append((owner, repo, pr_number, head_sha))
+
+        with patch.object(_worker, "run_console_check", side_effect=mock_check):
+            await _worker.handle_pull_request_synchronize(payload, "tok", None)
+
+        self.assertEqual(called, [("OWASP-BLT", "BLT", 55, "abc999")])
+
+    async def _test_skips_bot_sender(self):
+        payload = {
+            "repository": {"owner": {"login": "OWASP-BLT"}, "name": "BLT"},
+            "sender": {"login": "dependabot[bot]", "type": "Bot"},
+            "pull_request": {"number": 1, "head": {"sha": "x"}},
+        }
+        called = []
+
+        async def mock_check(*a, **k):
+            called.append(True)
+
+        with patch.object(_worker, "run_console_check", side_effect=mock_check):
+            await _worker.handle_pull_request_synchronize(payload, "tok")
+
+        self.assertEqual(called, [])
+
+    async def _test_skips_missing_sha(self):
+        payload = {
+            "repository": {"owner": {"login": "OWASP-BLT"}, "name": "BLT"},
+            "sender": {"login": "alice", "type": "User"},
+            "pull_request": {"number": 1, "head": {}},
+        }
+        called = []
+
+        async def mock_check(*a, **k):
+            called.append(True)
+
+        with patch.object(_worker, "run_console_check", side_effect=mock_check):
+            await _worker.handle_pull_request_synchronize(payload, "tok")
+
+        self.assertEqual(called, [])
+
+    def test_calls_console_check(self):
+        _run(self._test_calls_console_check())
+
+    def test_skips_bot_sender(self):
+        _run(self._test_skips_bot_sender())
+
+    def test_skips_missing_sha(self):
+        _run(self._test_skips_missing_sha())
+
+
+class TestHandlePullRequestOpenedRunsCheck(unittest.TestCase):
+    """Verify handle_pull_request_opened calls run_console_check."""
+
+    async def _test_console_check_called_on_open(self):
+        payload = {
+            "action": "opened",
+            "repository": {"owner": {"login": "OWASP-BLT"}, "name": "BLT"},
+            "sender": {"login": "bob", "type": "User"},
+            "pull_request": {
+                "number": 77,
+                "user": {"login": "bob", "type": "User"},
+                "head": {"sha": "deadbeef"},
+            },
+            "installation": {"id": 1},
+        }
+        check_calls = []
+
+        async def mock_check(owner, repo, pr_number, head_sha, token):
+            check_calls.append((pr_number, head_sha))
+
+        with patch.object(_worker, "run_console_check", side_effect=mock_check), \
+             patch.object(_worker, "_check_and_close_excess_prs", new=AsyncMock(return_value=False)), \
+             patch.object(_worker, "_track_pr_opened_in_d1", new=AsyncMock()), \
+             patch.object(_worker, "create_comment", new=AsyncMock()), \
+             patch.object(_worker, "_post_or_update_leaderboard", new=AsyncMock()), \
+             patch.object(_worker, "console", new=types.SimpleNamespace(error=lambda *a: None, log=lambda *a: None)):
+            await _worker.handle_pull_request_opened(payload, "tok", None)
+
+        self.assertEqual(check_calls, [(77, "deadbeef")])
+
+    async def _test_skips_when_no_sha(self):
+        """If head SHA is missing, console check should not be called."""
+        payload = {
+            "repository": {"owner": {"login": "OWASP-BLT"}, "name": "BLT"},
+            "sender": {"login": "carol", "type": "User"},
+            "pull_request": {
+                "number": 88,
+                "user": {"login": "carol", "type": "User"},
+                "head": {},
+            },
+        }
+        check_calls = []
+
+        async def mock_check(*a, **k):
+            check_calls.append(True)
+
+        with patch.object(_worker, "run_console_check", side_effect=mock_check), \
+             patch.object(_worker, "_check_and_close_excess_prs", new=AsyncMock(return_value=False)), \
+             patch.object(_worker, "_track_pr_opened_in_d1", new=AsyncMock()), \
+             patch.object(_worker, "create_comment", new=AsyncMock()), \
+             patch.object(_worker, "_post_or_update_leaderboard", new=AsyncMock()), \
+             patch.object(_worker, "console", new=types.SimpleNamespace(error=lambda *a: None, log=lambda *a: None)):
+            await _worker.handle_pull_request_opened(payload, "tok", None)
+
+        self.assertEqual(check_calls, [])
+
+    def test_console_check_called_on_open(self):
+        _run(self._test_console_check_called_on_open())
+
+    def test_skips_when_no_sha(self):
+        _run(self._test_skips_when_no_sha())
+
+
+class TestConsolePatternConstant(unittest.TestCase):
+    """Verify the compiled regex constant works correctly."""
+
+    def test_matches_console_log(self):
+        self.assertIsNotNone(_worker._CONSOLE_PATTERN.search("console.log('x')"))
+
+    def test_matches_console_error(self):
+        self.assertIsNotNone(_worker._CONSOLE_PATTERN.search("  console.error(err)"))
+
+    def test_matches_console_warn_with_spaces(self):
+        self.assertIsNotNone(_worker._CONSOLE_PATTERN.search("console.warn  (deprecated)"))
+
+    def test_does_not_match_console_deref_no_call(self):
+        # console.LOG without parentheses — not a call, should not match
+        self.assertIsNone(_worker._CONSOLE_PATTERN.search("// console.logging docs"))
+
+    def test_js_extensions_constant(self):
+        exts = _worker._CONSOLE_JS_EXTENSIONS
+        self.assertIn(".js", exts)
+        self.assertIn(".ts", exts)
+        self.assertIn(".jsx", exts)
+        self.assertIn(".tsx", exts)
+
+
 if __name__ == "__main__":
     unittest.main()
