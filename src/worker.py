@@ -22,9 +22,10 @@ import calendar
 import hashlib
 import hmac as _hmac
 import json
+import re
 import time
 from typing import Optional, Tuple
-from urllib.parse import urlparse
+from urllib.parse import quote as _url_quote, urlparse
 
 from js import Headers, Response, console, fetch  # Cloudflare Workers JS bindings
 from index_template import INDEX_HTML  # Landing page HTML template
@@ -39,6 +40,17 @@ LEADERBOARD_COMMAND = "/leaderboard"
 MAX_ASSIGNEES = 1
 ASSIGNMENT_DURATION_HOURS = 8
 BUG_LABELS = {"bug", "vulnerability", "security"}
+
+# JS/TS file extensions subject to the console statement check
+_CONSOLE_JS_EXTENSIONS = (".js", ".ts", ".jsx", ".tsx")
+
+# Regex pattern from check-console-log.yml — matches any console.* call
+_CONSOLE_PATTERN = re.compile(r"console\.[a-zA-Z]+\s*\(")
+
+# Regexes used by _scan_console_statements to strip noise before testing a line
+_BLOCK_COMMENT_RE = re.compile(r"/\*.*?\*/", re.DOTALL)
+_INLINE_COMMENT_RE = re.compile(r"//.*")
+_STRING_LITERAL_RE = re.compile(r'"(?:[^"\\]|\\.)*"|\'(?:[^\'\\]|\\.)*\'|`(?:[^`\\]|\\.)*`')
 
 # DER OID sequence for rsaEncryption (used when wrapping PKCS#1 → PKCS#8)
 _RSA_OID_SEQ = bytes([
@@ -1301,7 +1313,6 @@ async def _calculate_leaderboard_stats(owner: str, repos: list, token: str, wind
 def _parse_github_timestamp(ts_str: str) -> int:
     """Parse GitHub ISO 8601 timestamp to Unix timestamp."""
     # GitHub timestamps are like: 2024-03-05T12:34:56Z
-    import re
     match = re.match(r"(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})Z", ts_str)
     if match:
         year, month, day, hour, minute, second = map(int, match.groups())
@@ -1851,7 +1862,12 @@ async def handle_pull_request_opened(payload: dict, token: str, env=None) -> Non
 
     # Track open PR counter in D1.
     await _track_pr_opened_in_d1(payload, env)
-    
+
+    # Run console statement check via GitHub Checks API.
+    head_sha = pr.get("head", {}).get("sha", "")
+    if head_sha:
+        await run_console_check(owner, repo, pr_number, head_sha, token)
+
     # Post welcome message
     body = (
         f"👋 Thanks for opening this pull request, @{author_login}!\n\n"
@@ -1865,7 +1881,7 @@ async def handle_pull_request_opened(payload: dict, token: str, env=None) -> Non
         "🚀 Keep up the great work! — [OWASP BLT](https://owaspblt.org)"
     )
     await create_comment(owner, repo, pr_number, body, token)
-    
+
     # Post leaderboard
     if env is None:
         await _post_or_update_leaderboard(owner, repo, pr_number, author_login, token)
@@ -1913,6 +1929,285 @@ async def handle_pull_request_closed(payload: dict, token: str, env=None) -> Non
 async def handle_pull_request_review_submitted(payload: dict, env=None) -> None:
     """Track review credits in D1 (first two unique reviewers per PR per month)."""
     await _track_review_in_d1(payload, env)
+
+
+# ---------------------------------------------------------------------------
+# GitHub Checks API helpers
+# ---------------------------------------------------------------------------
+
+
+async def create_check_run(owner: str, repo: str, name: str, head_sha: str, token: str) -> int:
+    """Create a GitHub check run in 'in_progress' state. Returns check_run_id or 0 on failure."""
+    now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    resp = await github_api(
+        "POST",
+        f"/repos/{owner}/{repo}/check-runs",
+        token,
+        {
+            "name": name,
+            "head_sha": head_sha,
+            "status": "in_progress",
+            "started_at": now,
+        },
+    )
+    if resp.status not in (200, 201):
+        err_text = ""
+        try:
+            err_text = await resp.text()
+        except Exception:
+            pass
+        console.error(
+            f"[Checks] Failed to create check run '{name}': "
+            f"status={resp.status} body={err_text[:200]}"
+        )
+        return 0
+    data = json.loads(await resp.text())
+    run_id = data.get("id", 0)
+    console.log(f"[Checks] Created check run '{name}' id={run_id} sha={head_sha[:8]}")
+    return run_id
+
+
+async def update_check_run(
+    owner: str,
+    repo: str,
+    check_run_id: int,
+    conclusion: str,
+    title: str,
+    summary: str,
+    annotations: list,
+    token: str,
+) -> None:
+    """Complete a GitHub check run with a conclusion and optional inline annotations.
+
+    conclusion must be one of: success, failure, neutral, cancelled, skipped,
+    timed_out, action_required.
+    GitHub caps annotations at 50 per request.
+    """
+    now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    body = {
+        "status": "completed",
+        "conclusion": conclusion,
+        "completed_at": now,
+        "output": {
+            "title": title,
+            "summary": summary,
+            "annotations": annotations[:50],
+        },
+    }
+    resp = await github_api(
+        "PATCH",
+        f"/repos/{owner}/{repo}/check-runs/{check_run_id}",
+        token,
+        body,
+    )
+    if resp.status not in (200, 201):
+        err_text = ""
+        try:
+            err_text = await resp.text()
+        except Exception:
+            pass
+        console.error(
+            f"[Checks] Failed to update check run {check_run_id}: "
+            f"status={resp.status} body={err_text[:200]}"
+        )
+    else:
+        console.log(
+            f"[Checks] Updated check run {check_run_id}: "
+            f"conclusion={conclusion} annotations={len(annotations)}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Console statement check
+# ---------------------------------------------------------------------------
+
+
+def _scan_console_statements(content: str, filename: str) -> list:
+    """Scan file content for console.* calls and return GitHub Check annotation dicts.
+
+    Strips block comments (preserving newlines so line numbers stay accurate),
+    neutralises string literals, and removes inline comment tails before
+    running _CONSOLE_PATTERN to avoid false positives from commented-out or
+    string-embedded console calls.
+    """
+    # Replace block comment bodies with spaces, preserving each newline so that
+    # line numbers in annotations remain accurate after splitting.
+    def _blank_block_comment(m: re.Match) -> str:
+        return re.sub(r"[^\n]", " ", m.group(0))
+    content = _BLOCK_COMMENT_RE.sub(_blank_block_comment, content)
+
+    annotations = []
+    for line_no, line in enumerate(content.splitlines(), start=1):
+        stripped = line.lstrip()
+        # Skip lines that are entirely single-line or block-comment leaders
+        if stripped.startswith("//") or stripped.startswith("*"):
+            continue
+        # Neutralise string literals first, then strip inline comment tail so
+        # that console.* inside a string or after // is not flagged.
+        cleaned = _STRING_LITERAL_RE.sub("", stripped)
+        cleaned = _INLINE_COMMENT_RE.sub("", cleaned)
+        if _CONSOLE_PATTERN.search(cleaned):
+            preview = stripped[:120]
+            annotations.append({
+                "path": filename,
+                "start_line": line_no,
+                "end_line": line_no,
+                "annotation_level": "failure",
+                "title": "Console statement detected",
+                "message": f"Remove this `console.*` statement before merging: `{preview}`",
+            })
+    return annotations
+
+
+async def run_console_check(owner: str, repo: str, pr_number: int, head_sha: str, token: str) -> None:
+    """Fetch changed JS/TS files in a PR, scan for console.* calls, report via Checks API.
+
+    Mirrors the logic from .github/workflows/check-console-log.yml but runs
+    natively in the Cloudflare Worker using the GitHub Contents and Checks APIs.
+    Caps file scanning at 20 files to stay within Cloudflare's subrequest budget.
+    """
+    check_run_id = await create_check_run(
+        owner, repo, "Console Statement Check", head_sha, token
+    )
+    if not check_run_id:
+        # Checks API likely not permitted (missing checks:write scope) — skip silently
+        return
+
+    # Fetch all files changed in the PR, paginating until no further pages
+    all_pr_files: list = []
+    page = 1
+    while True:
+        files_resp = await github_api(
+            "GET",
+            f"/repos/{owner}/{repo}/pulls/{pr_number}/files?per_page=100&page={page}",
+            token,
+        )
+        if files_resp.status != 200:
+            await update_check_run(
+                owner, repo, check_run_id,
+                "neutral",
+                "Console Statement Check — skipped",
+                "Could not fetch the list of files changed in this PR.",
+                [],
+                token,
+            )
+            return
+        page_files = json.loads(await files_resp.text())
+        all_pr_files.extend(page_files)
+        if len(page_files) < 100:
+            break
+        page += 1
+    pr_files = all_pr_files
+
+    # Filter to JS/TS files that are added or modified (not removed)
+    js_files = [
+        f for f in pr_files
+        if any(f.get("filename", "").endswith(ext) for ext in _CONSOLE_JS_EXTENSIONS)
+        and f.get("status") != "removed"
+    ]
+    total_js_files = len(js_files)
+    js_files = js_files[:20]  # Cap to stay within Cloudflare subrequest budget
+
+    all_annotations = []
+    scanned = 0
+    skipped = 0
+    for file_info in js_files:
+        filename = file_info.get("filename", "")
+        content_resp = await github_api(
+            "GET",
+            # safe='/' preserves path separators; spaces/# and other special chars are encoded
+            f"/repos/{owner}/{repo}/contents/{_url_quote(filename, safe='/')}?ref={head_sha}",
+            token,
+        )
+        if content_resp.status != 200:
+            skipped += 1
+            continue
+        data = json.loads(await content_resp.text())
+        encoding = data.get("encoding", "base64")
+        raw_b64 = data.get("content", "")
+        # Skip files that GitHub couldn't inline (e.g. >1 MB returns encoding="none")
+        if not raw_b64 or encoding != "base64":
+            skipped += 1
+            continue
+        try:
+            content = base64.b64decode(raw_b64.replace("\n", "")).decode("utf-8", errors="replace")
+        except Exception:
+            skipped += 1
+            continue
+        all_annotations.extend(_scan_console_statements(content, filename))
+        scanned += 1
+
+    issue_count = len(all_annotations)
+    file_word = "file" if scanned == 1 else "files"
+
+    if all_annotations:
+        plural = "s" if issue_count != 1 else ""
+        conclusion = "failure"
+        title = f"Console Statement Check — {issue_count} issue{plural} found"
+        summary = (
+            f"Found **{issue_count}** `console.*` call{plural} across {scanned} JS/TS {file_word}.\n\n"
+            "Remove all `console.*` statements before merging. "
+            "Use structured logging or remove debug output entirely."
+        )
+        if total_js_files > 20:
+            summary += (
+                f"\n\n⚠️ Only the first 20 of {total_js_files} JS/TS files were scanned "
+                "(Worker subrequest limit). Additional violations may exist in unscanned files."
+            )
+        if skipped:
+            summary += (
+                f"\n\n⚠️ {skipped} file(s) could not be read (too large or unsupported encoding) "
+                "and were skipped."
+            )
+    elif total_js_files > 20:
+        conclusion = "neutral"
+        title = "Console Statement Check — partial scan ⚠️"
+        summary = (
+            f"Only the first 20 of **{total_js_files}** JS/TS files were scanned "
+            "(Cloudflare Worker subrequest limit). No violations were found in the scanned "
+            "files, but the remaining files were not checked — please review them manually."
+        )
+        if skipped:
+            summary += (
+                f"\n\n⚠️ {skipped} file(s) could not be read (too large or unsupported encoding) "
+                "and were skipped."
+            )
+    elif skipped:
+        conclusion = "neutral"
+        title = "Console Statement Check — partial scan ⚠️"
+        summary = (
+            f"{skipped} JS/TS file(s) could not be read (too large or unsupported encoding) "
+            f"and were skipped. No violations were found in the {scanned} readable {file_word}."
+        )
+    else:
+        conclusion = "success"
+        title = "Console Statement Check — passed ✅"
+        summary = (
+            f"No `console.*` statements found across {scanned} JS/TS {file_word}. Great work!"
+            if scanned > 0
+            else "No JS/TS files changed in this PR."
+        )
+
+    await update_check_run(
+        owner, repo, check_run_id, conclusion, title, summary, all_annotations, token
+    )
+
+
+async def handle_pull_request_synchronize(payload: dict, token: str, env=None) -> None:
+    """Re-run CI checks when new commits are pushed to an open PR."""
+    pr = payload.get("pull_request") or {}
+    sender = payload.get("sender") or {}
+    if not _is_human(sender) or _is_bot(sender):
+        return
+
+    owner = (payload.get("repository") or {}).get("owner", {}).get("login", "")
+    repo = (payload.get("repository") or {}).get("name", "")
+    pr_number = pr.get("number")
+    head_sha = (pr.get("head") or {}).get("sha", "")
+    if not (owner and repo and pr_number and head_sha):
+        return
+
+    await run_console_check(owner, repo, pr_number, head_sha, token)
 
 
 # ---------------------------------------------------------------------------
@@ -1994,6 +2289,8 @@ async def handle_webhook(request, env) -> Response:
         elif event == "pull_request":
             if action == "opened":
                 await handle_pull_request_opened(payload, token, env)
+            elif action == "synchronize":
+                await handle_pull_request_synchronize(payload, token, env)
             elif action == "closed":
                 await handle_pull_request_closed(payload, token, env)
         elif event == "pull_request_review" and action == "submitted":
