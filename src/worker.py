@@ -14,7 +14,7 @@ Environment variables / secrets (configure via ``wrangler.toml`` or
     GITHUB_APP_SLUG    — GitHub App slug used to build the install URL
     BLT_API_URL        — BLT API base URL (default: https://blt-api.owasp-blt.workers.dev)
     GITHUB_CLIENT_ID   — OAuth client ID (optional)
-    GITHUB_CLIENT_SECRET — OAuth client secret (optional)
+    GITHUB_CLIENT_SECRET — OAuth client secret (optional).
 """
 
 import base64
