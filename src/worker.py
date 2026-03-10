@@ -1,4 +1,4 @@
-"""BLT GitHub App — Python Cloudflare Worker.
+﻿"""BLT GitHub App — Python Cloudflare Worker.
 
 Handles GitHub webhooks and serves a landing homepage.
 This is the Python / Cloudflare Workers port of the original Node.js Probot app.
@@ -22,9 +22,10 @@ import calendar
 import hashlib
 import hmac as _hmac
 import json
+import re
 import time
 from typing import Optional, Tuple
-from urllib.parse import quote, urlparse
+from urllib.parse import quote as _url_quote, urlparse
 
 from js import Headers, Response, console, fetch  # Cloudflare Workers JS bindings
 from index_template import INDEX_HTML  # Landing page HTML template
@@ -39,6 +40,15 @@ LEADERBOARD_COMMAND = "/leaderboard"
 MAX_ASSIGNEES = 1
 ASSIGNMENT_DURATION_HOURS = 8
 BUG_LABELS = {"bug", "vulnerability", "security"}
+
+# JS/TS file extensions subject to the console statement check
+_CONSOLE_JS_EXTENSIONS = (".js", ".ts", ".jsx", ".tsx")
+
+# Regex pattern from check-console-log.yml — matches any console.* call
+_CONSOLE_PATTERN = re.compile(r"console\.[a-zA-Z]+\s*\(")
+_STRIP_STRINGS_RE = re.compile(r'"[^"]*"|\'[^\']*\'|`[^`]*`')
+_STRIP_INLINE_RE = re.compile(r"//.*")
+
 
 # DER OID sequence for rsaEncryption (used when wrapping PKCS#1 → PKCS#8)
 _RSA_OID_SEQ = bytes([
@@ -1301,7 +1311,6 @@ async def _calculate_leaderboard_stats(owner: str, repos: list, token: str, wind
 def _parse_github_timestamp(ts_str: str) -> int:
     """Parse GitHub ISO 8601 timestamp to Unix timestamp."""
     # GitHub timestamps are like: 2024-03-05T12:34:56Z
-    import re
     match = re.match(r"(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})Z", ts_str)
     if match:
         year, month, day, hour, minute, second = map(int, match.groups())
@@ -1851,7 +1860,12 @@ async def handle_pull_request_opened(payload: dict, token: str, env=None) -> Non
 
     # Track open PR counter in D1.
     await _track_pr_opened_in_d1(payload, env)
-    
+
+    # Run console statement check via GitHub Checks API.
+    head_sha = pr.get("head", {}).get("sha", "")
+    if head_sha:
+        await run_console_check(owner, repo, pr_number, head_sha, token)
+
     # Post welcome message
     body = (
         f"👋 Thanks for opening this pull request, @{author_login}!\n\n"
@@ -1865,7 +1879,7 @@ async def handle_pull_request_opened(payload: dict, token: str, env=None) -> Non
         "🚀 Keep up the great work! — [OWASP BLT](https://owaspblt.org)"
     )
     await create_comment(owner, repo, pr_number, body, token)
-    
+
     # Post leaderboard
     if env is None:
         await _post_or_update_leaderboard(owner, repo, pr_number, author_login, token)
@@ -1921,32 +1935,6 @@ async def handle_pull_request_review_submitted(payload: dict, env=None) -> None:
     await _track_review_in_d1(payload, env)
 
 
-async def _ensure_label_exists(
-    owner: str, repo: str, name: str, color: str, token: str
-) -> None:
-    """Create a label if it does not already exist, or update its colour."""
-    resp = await github_api(
-        "GET",
-        f"/repos/{owner}/{repo}/labels/{quote(name, safe='')}",
-        token,
-    )
-    if resp.status == 404:
-        await github_api(
-            "POST",
-            f"/repos/{owner}/{repo}/labels",
-            token,
-            {"name": name, "color": color},
-        )
-    elif resp.status == 200:
-        data = json.loads(await resp.text())
-        if data.get("color") != color:
-            await github_api(
-                "PATCH",
-                f"/repos/{owner}/{repo}/labels/{quote(name, safe='')}",
-                token,
-                {"color": color},
-            )
-
 async def check_unresolved_conversations(payload, token):
     """Add label if PR has unresolved review conversations"""
     pr = payload.get("pull_request")
@@ -2000,8 +1988,6 @@ async def check_unresolved_conversations(payload, token):
         .get("nodes", [])
     )
 
-    unresolved = any(not t.get("isResolved", True) for t in threads)
-
     unresolved_count = sum(not t.get("isResolved", True) for t in threads)
 
     # Remove any existing unresolved-conversations labels
@@ -2016,16 +2002,13 @@ async def check_unresolved_conversations(payload, token):
             if lb["name"].startswith("unresolved-conversations"):
                 await github_api(
                     "DELETE",
-                    f"/repos/{owner}/{repo}/issues/{number}/labels/{quote(lb['name'], safe='')}",
+                    f"/repos/{owner}/{repo}/issues/{number}/labels/{_url_quote(lb['name'], safe='')}",
                     token,
                 )
 
     label = f"unresolved-conversations: {unresolved_count}"
-
-    if unresolved:
-        await _ensure_label_exists(owner, repo, label, "e74c3c", token)
-    else:
-        await _ensure_label_exists(owner, repo, label, "5cb85c", token)
+    color = "e74c3c" if unresolved_count else "5cb85c"
+    await ensure_label_exists(owner, repo, label, color, "", token)
 
     await github_api(
         "POST",
@@ -2113,31 +2096,26 @@ async def get_valid_reviewers(owner: str, repo: str, pr_number: int, pr_author: 
     return list(valid_reviewers)
 
 
-async def ensure_label_exists(owner: str, repo: str, label_name: str, color: str, description: str, token: str) -> None:
+async def ensure_label_exists(owner: str, repo: str, label_name: str, color: str, description: str = "", token: str = "") -> None:
     """Create or update a label to ensure it exists with the correct color/description."""
-    resp = await github_api("GET", f"/repos/{owner}/{repo}/labels/{label_name}", token)
-    
+    encoded = _url_quote(label_name, safe="")
+    resp = await github_api("GET", f"/repos/{owner}/{repo}/labels/{encoded}", token)
     if resp.status == 200:
-        # Label exists, check if it needs update
         data = json.loads(await resp.text())
-        if data.get("color") != color or data.get("description") != description:
-            update_resp = await github_api("PATCH", f"/repos/{owner}/{repo}/labels/{label_name}", token, {
-                "color": color,
-                "description": description,
-            })
+        if data.get("color") != color or (description and data.get("description") != description):
+            body = {"color": color}
+            if description:
+                body["description"] = description
+            update_resp = await github_api("PATCH", f"/repos/{owner}/{repo}/labels/{encoded}", token, body)
             if update_resp.status not in (200, 201):
-                error_text = await update_resp.text() if update_resp.status >= 400 else ""
-                console.error(f"[BLT] Failed to update label {label_name}: {update_resp.status} {error_text}")
+                console.error(f"[BLT] Failed to update label {label_name}: {update_resp.status}")
     elif resp.status == 404:
-        # Label doesn't exist, create it
-        create_resp = await github_api("POST", f"/repos/{owner}/{repo}/labels", token, {
-            "name": label_name,
-            "color": color,
-            "description": description,
-        })
+        body = {"name": label_name, "color": color}
+        if description:
+            body["description"] = description
+        create_resp = await github_api("POST", f"/repos/{owner}/{repo}/labels", token, body)
         if create_resp.status not in (200, 201):
-            error_text = await create_resp.text() if create_resp.status >= 400 else ""
-            console.error(f"[BLT] Failed to create label {label_name}: {create_resp.status} {error_text}")
+            console.error(f"[BLT] Failed to create label {label_name}: {create_resp.status}")
 
 
 async def update_peer_review_labels(owner: str, repo: str, pr_number: int, has_review: bool, token: str) -> None:
@@ -2238,6 +2216,166 @@ async def handle_pull_request_for_review(payload: dict, token: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# GitHub Checks API helpers
+# ---------------------------------------------------------------------------
+
+
+async def create_check_run(owner: str, repo: str, name: str, head_sha: str, token: str) -> int:
+    """Create a GitHub check run in 'in_progress' state. Returns check_run_id or 0 on failure."""
+    now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    resp = await github_api(
+        "POST",
+        f"/repos/{owner}/{repo}/check-runs",
+        token,
+        {"name": name, "head_sha": head_sha, "status": "in_progress", "started_at": now},
+    )
+    if resp.status not in (200, 201):
+        console.error(f"[Checks] Failed to create check run '{name}': status={resp.status}")
+        return 0
+    return json.loads(await resp.text()).get("id", 0)
+
+
+async def update_check_run(
+    owner: str,
+    repo: str,
+    check_run_id: int,
+    conclusion: str,
+    title: str,
+    summary: str,
+    annotations: list,
+    token: str,
+) -> None:
+    """Complete a GitHub check run. GitHub caps annotations at 50 per request."""
+    now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    resp = await github_api(
+        "PATCH",
+        f"/repos/{owner}/{repo}/check-runs/{check_run_id}",
+        token,
+        {
+            "status": "completed",
+            "conclusion": conclusion,
+            "completed_at": now,
+            "output": {"title": title, "summary": summary, "annotations": annotations[:50]},
+        },
+    )
+    if resp.status not in (200, 201):
+        body = await resp.text()
+        console.error(
+            f"[Checks] Failed to update check run: owner={owner} repo={repo} "
+            f"check_run_id={check_run_id} status={resp.status} response={body}"
+        )
+        raise RuntimeError(
+            f"update_check_run failed for {owner}/{repo}#{check_run_id}: "
+            f"HTTP {resp.status} — {body}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Console statement check
+# ---------------------------------------------------------------------------
+
+
+def _scan_console_statements(content: str, filename: str) -> list:
+    """Return GitHub Check annotation dicts for each console.* call found."""
+    annotations = []
+    in_block = False
+    for line_no, line in enumerate(content.splitlines(), start=1):
+        stripped = line.lstrip()
+        if in_block:
+            if "*/" in stripped:
+                in_block = False
+            continue
+        if stripped.startswith("//") or stripped.startswith("*"):
+            continue
+        if stripped.startswith("/*"):
+            if "*/" not in stripped:
+                in_block = True
+            continue
+        cleaned = _STRIP_INLINE_RE.sub("", _STRIP_STRINGS_RE.sub("", stripped))
+        if _CONSOLE_PATTERN.search(cleaned):
+            annotations.append({
+                "path": filename,
+                "start_line": line_no,
+                "end_line": line_no,
+                "annotation_level": "failure",
+                "title": "Console statement detected",
+                "message": f"Remove `console.*` before merging: `{stripped[:120]}`",
+            })
+    return annotations
+
+
+async def run_console_check(owner: str, repo: str, pr_number: int, head_sha: str, token: str) -> None:
+    """Scan changed JS/TS files in a PR for console.* calls and report via Checks API."""
+    check_run_id = await create_check_run(owner, repo, "Console Statement Check", head_sha, token)
+    if not check_run_id:
+        return
+
+    files_resp = await github_api(
+        "GET", f"/repos/{owner}/{repo}/pulls/{pr_number}/files?per_page=100", token
+    )
+    if files_resp.status != 200:
+        await update_check_run(
+            owner, repo, check_run_id, "neutral",
+            "Console Statement Check — skipped",
+            "Could not fetch the list of files changed in this PR.", [], token,
+        )
+        return
+
+    js_files = [
+        f for f in json.loads(await files_resp.text())
+        if any(f.get("filename", "").endswith(ext) for ext in _CONSOLE_JS_EXTENSIONS)
+        and f.get("status") != "removed"
+    ][:20]  # cap to stay within Cloudflare subrequest budget
+
+    annotations = []
+    for file_info in js_files:
+        filename = file_info.get("filename", "")
+        content_resp = await github_api(
+            "GET",
+            f"/repos/{owner}/{repo}/contents/{_url_quote(filename, safe='/')}?ref={head_sha}",
+            token,
+        )
+        if content_resp.status != 200:
+            continue
+        data = json.loads(await content_resp.text())
+        raw_b64 = data.get("content", "")
+        if not raw_b64 or data.get("encoding", "base64") != "base64":
+            continue
+        try:
+            content = base64.b64decode(raw_b64.replace("\n", "")).decode("utf-8", errors="replace")
+        except Exception:
+            continue
+        annotations.extend(_scan_console_statements(content, filename))
+
+    count = len(annotations)
+    if annotations:
+        conclusion = "failure"
+        title = f"Console Statement Check — {count} issue{'s' if count != 1 else ''} found"
+        summary = f"Found **{count}** `console.*` call{'s' if count != 1 else ''} in this PR. Remove all `console.*` statements before merging."
+    else:
+        conclusion = "success"
+        title = "Console Statement Check — passed"
+        summary = "No `console.*` statements found in changed JS/TS files."
+
+    await update_check_run(owner, repo, check_run_id, conclusion, title, summary, annotations, token)
+async def handle_pull_request_synchronize(payload: dict, token: str, env=None) -> None:
+    """Re-run CI checks when new commits are pushed to an open PR."""
+    pr = payload.get("pull_request") or {}
+    sender = payload.get("sender") or {}
+    if not _is_human(sender) or _is_bot(sender):
+        return
+
+    owner = (payload.get("repository") or {}).get("owner", {}).get("login", "")
+    repo = (payload.get("repository") or {}).get("name", "")
+    pr_number = pr.get("number")
+    head_sha = (pr.get("head") or {}).get("sha", "")
+    if not (owner and repo and pr_number and head_sha):
+        return
+
+    await run_console_check(owner, repo, pr_number, head_sha, token)
+
+
+# ---------------------------------------------------------------------------
 # Webhook dispatcher
 # ---------------------------------------------------------------------------
 
@@ -2317,7 +2455,10 @@ async def handle_webhook(request, env) -> Response:
             if action == "opened":
                 await handle_pull_request_opened(payload, token, env)
                 await handle_pull_request_for_review(payload, token)
-            elif action == "synchronize" or action == "reopened":
+            elif action == "synchronize":
+                await handle_pull_request_synchronize(payload, token, env)
+                await handle_pull_request_for_review(payload, token)
+            elif action == "reopened":
                 await handle_pull_request_for_review(payload, token)
             elif action == "closed":
                 await handle_pull_request_closed(payload, token, env)

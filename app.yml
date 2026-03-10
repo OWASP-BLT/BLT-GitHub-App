@@ -6,10 +6,14 @@ hook_attributes:
 redirect_url: https://example.com
 public: true
 default_permissions:
+  checks: write
   issues: write
   pull_requests: write
+  contents: read
   metadata: read
 default_events:
+  - check_run
+  - check_suite
   - issue_comment
   - issues
   - pull_request
