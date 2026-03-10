@@ -152,8 +152,8 @@ The leaderboard uses an **event-driven D1 model**:
 | `APP_ID` | ✅ | GitHub App numeric ID |
 | `PRIVATE_KEY` | ✅ | GitHub App RSA private key (full PEM, PKCS#1 or PKCS#8) |
 | `WEBHOOK_SECRET` | ✅ | GitHub App webhook secret |
-| `GITHUB_APP_SLUG` | ✅ | App URL slug shown in GitHub App URLs (e.g. `blt-pool`) |
-| `BLT_API_URL` | ✅ | BLT API base URL (default: `https://github-app.owaspblt.org`) |
+| `GITHUB_APP_SLUG` | ⬜ | App URL slug shown in GitHub App URLs (e.g. `blt-pool`). Defaults to empty string — install button falls back to a generic URL. |
+| `BLT_API_URL` | ⬜ | BLT API base URL (default: `https://blt-api.owasp-blt.workers.dev`) |
 | `GITHUB_CLIENT_ID` | ⬜ | OAuth client ID (optional, for OAuth flow) |
 | `GITHUB_CLIENT_SECRET` | ⬜ | OAuth client secret (optional, for OAuth flow) |
 
