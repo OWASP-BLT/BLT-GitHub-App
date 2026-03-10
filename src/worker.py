@@ -1,4 +1,4 @@
-"""BLT-Pool — Mentor Matching & GitHub Automation Platform.
+﻿"""BLT-Pool — Mentor Matching & GitHub Automation Platform.
 
 A dual-purpose platform that:
 1. Connects contributors with mentors through a shared mentor pool
@@ -191,7 +191,7 @@ def _gh_headers(token: str) -> Headers:
         "Authorization": f"Bearer {token}",
         "Accept": "application/vnd.github+json",
         "Content-Type": "application/json",
-        "User-Agent": "BLT-GitHub-App/1.0",
+        "User-Agent": "BLT-Pool/1.0",
         "X-GitHub-Api-Version": "2022-11-28",
     }.items())
 
@@ -217,7 +217,7 @@ async def get_installation_token(
             "Authorization": f"Bearer {jwt}",
             "Accept": "application/vnd.github+json",
             "Content-Type": "application/json",
-            "User-Agent": "BLT-GitHub-App/1.0",
+            "User-Agent": "BLT-Pool/1.0",
             "X-GitHub-Api-Version": "2022-11-28",
         }.items()),
     )
@@ -237,7 +237,7 @@ async def get_installation_access_token(installation_id: int, jwt_token: str) ->
             "Authorization": f"Bearer {jwt_token}",
             "Accept": "application/vnd.github+json",
             "Content-Type": "application/json",
-            "User-Agent": "BLT-GitHub-App/1.0",
+            "User-Agent": "BLT-Pool/1.0",
             "X-GitHub-Api-Version": "2022-11-28",
         }.items()),
     )
@@ -2742,7 +2742,7 @@ _CALLBACK_HTML = """\
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>BLT GitHub App — Installed!</title>
+    <title>BLT-Pool GitHub App — Installed!</title>
   <script src="https://cdn.tailwindcss.com"></script>
   <link
     rel="stylesheet"
@@ -2758,7 +2758,7 @@ _CALLBACK_HTML = """\
     </div>
     <h1 class="text-2xl font-bold text-white mb-4">Installation complete!</h1>
     <p class="leading-relaxed mb-6" style="color:#9ca3af;">
-      BLT GitHub App has been successfully installed on your organization.<br />
+    BLT-Pool GitHub App has been successfully installed on your organization.<br />
       Issues and pull requests will now be handled automatically.
     </p>
     <a
@@ -2826,7 +2826,7 @@ def _github_app_html(app_slug: str, env=None) -> str:
     install_url = (
         f"https://github.com/apps/{app_slug}/installations/new"
         if app_slug
-        else "https://github.com/apps/blt-github-app/installations/new"
+        else "https://github.com/apps/blt-pool/installations/new"
     )
     year = time.gmtime().tm_year
     secret_vars_html = _secret_vars_status_html(env) if env is not None else ""

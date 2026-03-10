@@ -1,4 +1,4 @@
-# BLT GitHub App - Architecture & Flow Documentation
+# BLT-Pool - Architecture & Flow Documentation
 
 ## Overview
 
