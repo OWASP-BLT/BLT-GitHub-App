@@ -934,7 +934,10 @@ class TestEnforcePRLimit(unittest.TestCase):
         async def mock_api(method, path, token, body=None):
             nonlocal closed
             if "pulls?state=open" in path:
-                return _MockResponse(200, open_prs)
+                import re as _re
+                m = _re.search(r"[?&]page=(\d+)", path)
+                page = int(m.group(1)) if m else 1
+                return _MockResponse(200, open_prs if page == 1 else [])
             if method == "PATCH" and "/pulls/" in path:
                 closed = True
             return _MockResponse(200)

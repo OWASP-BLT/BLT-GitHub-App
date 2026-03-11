@@ -2046,11 +2046,12 @@ async def handle_issue_opened(
             "our bug bounty platform.\n"
         )
         if is_bug and features.get("FEATURE_BUG_REPORTING", True):
+            matched_bug_label = next((lb for lb in labels if lb in BUG_LABELS), "bug")
             bug_data = await report_bug_to_blt(blt_api_url, {
                 "url": issue["html_url"],
                 "description": issue["title"],
                 "github_url": issue["html_url"],
-                "label": labels[0] if labels else "bug",
+                "label": matched_bug_label,
             })
             if bug_data and bug_data.get("id"):
                 msg += (
@@ -2061,11 +2062,12 @@ async def handle_issue_opened(
                 )
         await create_comment(owner, repo, issue["number"], msg, token)
     elif is_bug and features.get("FEATURE_BUG_REPORTING", True):
+        matched_bug_label = next((lb for lb in labels if lb in BUG_LABELS), "bug")
         await report_bug_to_blt(blt_api_url, {
             "url": issue["html_url"],
             "description": issue["title"],
             "github_url": issue["html_url"],
-            "label": labels[0] if labels else "bug",
+            "label": matched_bug_label,
         })
 
 
@@ -2399,6 +2401,8 @@ async def handle_pull_request_opened(payload: dict, token: str, env=None, featur
         await apply_migration_label(owner, repo, pr, token)
     if features.get("FEATURE_ISSUE_LINK_CHECK", True):
         await check_linked_issue(owner, repo, pr, token)
+    if features.get("FEATURE_CONFLICT_CHECK", True):
+        await check_pr_conflicts(owner, repo, pr, token)
 
 async def handle_pull_request_synchronize(payload: dict, token: str, features: dict | None = None) -> None:
     """Re-run automation labels when new commits are pushed to a PR."""
