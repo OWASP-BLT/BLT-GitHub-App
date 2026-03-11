@@ -572,12 +572,14 @@ class TestHandlePullRequestOpened(unittest.TestCase):
 class TestHandlePullRequestClosed(unittest.TestCase):
     """handle_pull_request_closed — mirrors handlePullRequestClosed in pull-request.test.js"""
 
-    def _run_closed(self, payload, comments):
+    def _run_closed(self, payload, comments, reviewers=None):
         async def _inner():
+            mock_reviewers = AsyncMock(return_value=reviewers or [])
             with patch.object(_worker, "create_comment", new=AsyncMock(side_effect=lambda o, r, n, b, t: comments.append(b))):
                 with patch.object(_worker, "_check_rank_improvement", new=AsyncMock()):
                     with patch.object(_worker, "_post_or_update_leaderboard", new=AsyncMock()):
-                        await _worker.handle_pull_request_closed(payload, "tok")
+                        with patch.object(_worker, "get_valid_reviewers", new=mock_reviewers):
+                            await _worker.handle_pull_request_closed(payload, "tok")
         _run(_inner())
 
     def test_posts_congratulations_when_merged(self):
@@ -587,6 +589,22 @@ class TestHandlePullRequestClosed(unittest.TestCase):
         self.assertEqual(len(comments), 1)
         self.assertIn("PR merged", comments[0])
         self.assertIn("alice", comments[0])
+
+    def test_thanks_reviewers_when_merged(self):
+        payload = _make_pr_payload(merged=True)
+        comments = []
+        self._run_closed(payload, comments, reviewers=["bob", "carol"])
+        self.assertEqual(len(comments), 1)
+        self.assertIn("@bob", comments[0])
+        self.assertIn("@carol", comments[0])
+        self.assertIn("reviewer", comments[0])
+
+    def test_no_reviewer_mention_when_no_reviewers(self):
+        payload = _make_pr_payload(merged=True)
+        comments = []
+        self._run_closed(payload, comments, reviewers=[])
+        self.assertEqual(len(comments), 1)
+        self.assertNotIn("reviewer", comments[0])
 
     def test_does_not_post_when_not_merged(self):
         payload = _make_pr_payload(merged=False)
@@ -1040,7 +1058,8 @@ class TestHandlePullRequestClosedLeaderboard(unittest.TestCase):
             with patch.object(_worker, "_post_or_update_leaderboard", new=_mock_leaderboard):
                 with patch.object(_worker, "_check_rank_improvement", new=_mock_rank):
                     with patch.object(_worker, "create_comment", new=AsyncMock(side_effect=lambda o, r, n, b, t: comment_calls.append(b))):
-                        await _worker.handle_pull_request_closed(payload, "tok")
+                        with patch.object(_worker, "get_valid_reviewers", new=AsyncMock(return_value=[])):
+                            await _worker.handle_pull_request_closed(payload, "tok")
         _run(_inner())
 
     def test_posts_leaderboard_and_checks_rank_on_merge(self):

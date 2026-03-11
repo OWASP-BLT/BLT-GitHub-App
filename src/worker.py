@@ -2106,6 +2106,10 @@ async def handle_pull_request_closed(payload: dict, token: str, env=None) -> Non
         "Your work is now part of the project. Keep contributing to "
         "[OWASP BLT](https://owaspblt.org) and help make the web a safer place! 🛡️"
     )
+    reviewers = await get_valid_reviewers(owner, repo, pr_number, author_login, token)
+    if reviewers:
+        reviewer_mentions = " ".join(f"@{r}" for r in reviewers)
+        body += f"\n\n👏 A big thank you to the reviewer(s) {reviewer_mentions} for their valuable feedback!"
     await create_comment(owner, repo, pr_number, body, token)
     
     # Leaderboard display already shows accurate ranking
