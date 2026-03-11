@@ -31,8 +31,6 @@ from urllib.parse import quote, urlparse
 from js import Headers, Response, console, fetch  # Cloudflare Workers JS bindings
 from index_template import INDEX_HTML  # Landing page HTML template
 
-logger = logging.getLogger(__name__)
-
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
@@ -2585,63 +2583,60 @@ async def handle_dependabot_pr(payload: dict, token: str, env=None) -> None:
     actor = ((payload.get("sender") or {}).get("login") or "")
 
     if not owner or not repo or pr_number is None:
-        logger.error(
-            "[BLT] Skip auto-approval: missing repository/PR metadata "
-            "repo=%s/%s pr=%s actor=%s author=%s",
-            owner or "-", repo or "-",
-            pr_number if pr_number is not None else "-",
-            actor or "-", pr_author,
+        console.error(
+            f"[BLT] Skip auto-approval: missing repository/PR metadata "
+            f"repo={owner or '-'}/{repo or '-'} pr={pr_number if pr_number is not None else '-'} "
+            f"actor={actor or '-'} author={pr_author}"
         )
         return
 
     pr_state = (pr.get("state") or "").strip().lower()
     if pr_state != "open":
-        logger.info(
-            "[BLT] Skip auto-approval: PR not open repo=%s/%s pr=%s actor=%s author=%s state=%s",
-            owner, repo, pr_number, actor or "-", pr_author, pr_state or "-",
+        console.log(
+            f"[BLT] Skip auto-approval: PR not open "
+            f"repo={owner}/{repo} pr={pr_number} actor={actor or '-'} "
+            f"author={pr_author} state={pr_state or '-'}"
         )
         return
 
     if not _is_dependabot(pr_author):
-        logger.info(
-            "[BLT] Skip auto-approval: non-Dependabot author repo=%s/%s pr=%s actor=%s author=%s",
-            owner, repo, pr_number, actor or "-", pr_author,
+        console.log(
+            f"[BLT] Skip auto-approval: non-Dependabot author "
+            f"repo={owner}/{repo} pr={pr_number} actor={actor or '-'} author={pr_author}"
         )
         return
 
     if pr.get("draft"):
-        logger.info(
-            "[BLT] Skip auto-approval: draft PR repo=%s/%s pr=%s actor=%s author=%s",
-            owner, repo, pr_number, actor or "-", pr_author,
+        console.log(
+            f"[BLT] Skip auto-approval: draft PR "
+            f"repo={owner}/{repo} pr={pr_number} actor={actor or '-'} author={pr_author}"
         )
         return
 
     head_repo = (pr.get("head") or {}).get("repo")
     base_repo = (pr.get("base") or {}).get("repo")
     if not head_repo or not base_repo:
-        logger.info(
-            "[BLT] Skip auto-approval: missing head/base repo in payload "
-            "repo=%s/%s pr=%s actor=%s author=%s",
-            owner, repo, pr_number, actor or "-", pr_author,
+        console.log(
+            f"[BLT] Skip auto-approval: missing head/base repo in payload "
+            f"repo={owner}/{repo} pr={pr_number} actor={actor or '-'} author={pr_author}"
         )
         return
 
     head_repo_full = head_repo.get("full_name") or ""
     base_repo_full = base_repo.get("full_name") or ""
     if head_repo_full != base_repo_full:
-        logger.info(
-            "[BLT] Skip auto-approval: fork-based PR repo=%s/%s pr=%s actor=%s "
-            "author=%s head_repo=%s base_repo=%s",
-            owner, repo, pr_number, actor or "-", pr_author,
-            head_repo_full, base_repo_full,
+        console.log(
+            f"[BLT] Skip auto-approval: fork-based PR "
+            f"repo={owner}/{repo} pr={pr_number} actor={actor or '-'} author={pr_author} "
+            f"head_repo={head_repo_full} base_repo={base_repo_full}"
         )
         return
 
     if not _is_dependabot_dependency_update(pr):
-        logger.info(
-            "[BLT] Skip auto-approval: not a dependency update repo=%s/%s pr=%s "
-            "actor=%s author=%s title=%s",
-            owner, repo, pr_number, actor or "-", pr_author, pr.get("title") or "-",
+        console.log(
+            f"[BLT] Skip auto-approval: not a dependency update "
+            f"repo={owner}/{repo} pr={pr_number} actor={actor or '-'} author={pr_author} "
+            f"title={pr.get('title') or '-'}"
         )
         return
 
@@ -2657,15 +2652,16 @@ async def handle_dependabot_pr(payload: dict, token: str, env=None) -> None:
     )
 
     if resp.status in (200, 201):
-        logger.info(
-            "[BLT] Auto-approved Dependabot PR repo=%s/%s pr=%s actor=%s author=%s",
-            owner, repo, pr_number, actor or "-", pr_author,
+        console.log(
+            f"[BLT] Auto-approved Dependabot PR "
+            f"repo={owner}/{repo} pr={pr_number} actor={actor or '-'} author={pr_author}"
         )
     else:
         error_text = await resp.text() if resp.status >= 400 else ""
-        logger.error(
-            "[BLT] Auto-approval failed repo=%s/%s pr=%s actor=%s author=%s status=%s error=%s",
-            owner, repo, pr_number, actor or "-", pr_author, resp.status, error_text,
+        console.error(
+            f"[BLT] Auto-approval failed "
+            f"repo={owner}/{repo} pr={pr_number} actor={actor or '-'} author={pr_author} "
+            f"status={resp.status} error={error_text}"
         )
 
 
