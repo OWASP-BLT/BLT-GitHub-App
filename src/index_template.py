@@ -70,6 +70,7 @@ GITHUB_PAGE_HTML = """\
       <nav class="hidden items-center gap-2 rounded-xl border border-blt-border bg-white p-1 md:flex" aria-label="Main">
         <a href="/" class="rounded-lg px-3 py-2 text-sm font-semibold text-gray-700 hover:bg-gray-50">Mentors</a>
         <a href="/github-app" class="rounded-lg bg-[#feeae9] px-3 py-2 text-sm font-semibold text-blt-primary">GitHub App</a>
+        <a href="/stats" class="rounded-lg px-3 py-2 text-sm font-semibold text-gray-700 hover:bg-gray-50">Stats</a>
         <a href="https://owaspblt.org" target="_blank" rel="noopener" class="rounded-lg px-3 py-2 text-sm font-semibold text-gray-700 hover:bg-gray-50">
           OWASP BLT <i class="fa-solid fa-arrow-up-right-from-square text-xs" aria-hidden="true"></i>
         </a>
@@ -250,6 +251,8 @@ GITHUB_PAGE_HTML = """\
       <span>Built for OWASP BLT contributors</span>
       <span aria-hidden="true">•</span>
       <a href="https://owaspblt.org" target="_blank" rel="noopener" class="text-red-600 hover:underline">owaspblt.org</a>
+      <span aria-hidden="true">•</span>
+      <a href="/stats" class="text-red-600 hover:underline">Stats</a>
       <span aria-hidden="true">•</span>
       <a href="https://github.com/OWASP-BLT/BLT-Pool" target="_blank" rel="noopener" class="text-red-600 hover:underline">BLT-Pool Repo</a>
       <span aria-hidden="true">•</span>

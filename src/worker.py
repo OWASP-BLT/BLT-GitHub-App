@@ -561,6 +561,22 @@ async def _ensure_leaderboard_schema(db) -> None:
         )
         """,
     )
+    await _d1_run(
+        db,
+        """
+        CREATE TABLE IF NOT EXISTS stats_daily (
+            org TEXT NOT NULL,
+            date TEXT NOT NULL,
+            prs_opened INTEGER NOT NULL DEFAULT 0,
+            prs_merged INTEGER NOT NULL DEFAULT 0,
+            prs_closed INTEGER NOT NULL DEFAULT 0,
+            reviews INTEGER NOT NULL DEFAULT 0,
+            comments INTEGER NOT NULL DEFAULT 0,
+            updated_at INTEGER NOT NULL,
+            PRIMARY KEY (org, date)
+        )
+        """,
+    )
 
 
 async def _d1_inc_open_pr(db, org: str, user_login: str, delta: int) -> None:
@@ -606,6 +622,29 @@ async def _d1_inc_monthly(db, org: str, month_key: str, user_login: str, field: 
         console.error(f"[D1] Failed to update {field} org={org} month={month_key} user={user_login}: {e}")
 
 
+async def _track_daily_stat(db, org: str, field: str, delta: int = 1) -> None:
+    """Increment a daily stat counter for the given org and today's UTC date."""
+    today = time.strftime("%Y-%m-%d", time.gmtime())
+    now = int(time.time())
+    valid_fields = {"prs_opened", "prs_merged", "prs_closed", "reviews", "comments"}
+    if field not in valid_fields:
+        return
+    try:
+        await _d1_run(
+            db,
+            f"""
+            INSERT INTO stats_daily (org, date, {field}, updated_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(org, date) DO UPDATE SET
+                {field} = stats_daily.{field} + excluded.{field},
+                updated_at = excluded.updated_at
+            """,
+            (org, today, delta, now),
+        )
+    except Exception as e:
+        console.error(f"[D1] Failed to update daily stat {field} for {org}: {e}")
+
+
 async def _track_pr_opened_in_d1(payload: dict, env) -> None:
     db = _d1_binding(env)
     if not db:
@@ -645,6 +684,7 @@ async def _track_pr_opened_in_d1(payload: dict, env) -> None:
         """,
         (org, repo, pr_number, author_login, now),
     )
+    await _track_daily_stat(db, org, "prs_opened", 1)
 
 
 async def _track_pr_closed_in_d1(payload: dict, env) -> None:
@@ -686,8 +726,10 @@ async def _track_pr_closed_in_d1(payload: dict, env) -> None:
     mk = _month_key(event_ts)
     if merged:
         await _d1_inc_monthly(db, org, mk, author_login, "merged_prs", 1)
+        await _track_daily_stat(db, org, "prs_merged", 1)
     else:
         await _d1_inc_monthly(db, org, mk, author_login, "closed_prs", 1)
+        await _track_daily_stat(db, org, "prs_closed", 1)
 
     now = int(time.time())
     await _d1_run(
@@ -726,6 +768,7 @@ async def _track_comment_in_d1(payload: dict, env) -> None:
     await _ensure_leaderboard_schema(db)
     mk = _month_key(_parse_github_timestamp(created_at) if created_at else int(time.time()))
     await _d1_inc_monthly(db, org, mk, login, "comments", 1)
+    await _track_daily_stat(db, org, "comments", 1)
 
 
 async def _track_review_in_d1(payload: dict, env) -> None:
@@ -787,6 +830,7 @@ async def _track_review_in_d1(payload: dict, env) -> None:
         (org, repo, pr_number, mk, reviewer_login, int(time.time())),
     )
     await _d1_inc_monthly(db, org, mk, reviewer_login, "reviews", 1)
+    await _track_daily_stat(db, org, "reviews", 1)
 
 
 async def _calculate_leaderboard_stats_from_d1(owner: str, env) -> Optional[dict]:
@@ -1297,6 +1341,545 @@ async def _reset_leaderboard_month(org: str, month_key: str, db) -> dict:
 
     console.log(f"[AdminReset] Cleared leaderboard data for org={org} month={month_key}")
     return deleted
+
+
+async def _get_stats_data(org: str, db) -> dict:
+    """Fetch all stats data from D1 for the /stats page.
+
+    Returns a dict containing:
+    - org: the requested org
+    - all_orgs: list of all known orgs in D1
+    - daily_data: list of 30 per-day dicts (date, prs_opened, prs_merged, prs_closed, reviews, comments)
+    - totals: 30-day aggregate counts
+    - monthly_data: last 6 months of aggregate rows
+    - open_pr_count: current total open PRs for the org
+    - top_contributors: top 15 contributors for the current month
+    - current_month: YYYY-MM key for the active month
+    """
+    await _ensure_leaderboard_schema(db)
+
+    # Collect all known orgs from every relevant table.
+    all_orgs: list = []
+    for table in ("stats_daily", "leaderboard_monthly_stats", "leaderboard_open_prs"):
+        try:
+            rows = await _d1_all(db, f"SELECT DISTINCT org FROM {table} ORDER BY org", ())
+            for row in rows or []:
+                o = row.get("org")
+                if o and o not in all_orgs:
+                    all_orgs.append(o)
+        except Exception:
+            pass
+
+    # Build the 30-day date range (oldest → newest).
+    now_ts = int(time.time())
+    dates_30 = [
+        time.strftime("%Y-%m-%d", time.gmtime(now_ts - (29 - i) * 86400))
+        for i in range(30)
+    ]
+
+    # Query daily stats for the org over the last 30 days.
+    daily_rows: list = []
+    if org:
+        try:
+            daily_rows = await _d1_all(
+                db,
+                """
+                SELECT date, prs_opened, prs_merged, prs_closed, reviews, comments
+                FROM stats_daily
+                WHERE org = ? AND date >= ?
+                ORDER BY date ASC
+                """,
+                (org, dates_30[0]),
+            )
+        except Exception:
+            pass
+
+    daily_map = {row.get("date"): row for row in (daily_rows or [])}
+    daily_data = [
+        {
+            "date": d,
+            "prs_opened": int((daily_map.get(d) or {}).get("prs_opened") or 0),
+            "prs_merged": int((daily_map.get(d) or {}).get("prs_merged") or 0),
+            "prs_closed": int((daily_map.get(d) or {}).get("prs_closed") or 0),
+            "reviews": int((daily_map.get(d) or {}).get("reviews") or 0),
+            "comments": int((daily_map.get(d) or {}).get("comments") or 0),
+        }
+        for d in dates_30
+    ]
+
+    totals = {
+        "prs_opened": sum(d["prs_opened"] for d in daily_data),
+        "prs_merged": sum(d["prs_merged"] for d in daily_data),
+        "prs_closed": sum(d["prs_closed"] for d in daily_data),
+        "reviews": sum(d["reviews"] for d in daily_data),
+        "comments": sum(d["comments"] for d in daily_data),
+    }
+
+    # Monthly aggregates — last 6 months.
+    monthly_data: list = []
+    if org:
+        try:
+            monthly_data = await _d1_all(
+                db,
+                """
+                SELECT month_key,
+                       SUM(merged_prs)  AS merged_prs,
+                       SUM(closed_prs)  AS closed_prs,
+                       SUM(reviews)     AS reviews,
+                       SUM(comments)    AS comments
+                FROM leaderboard_monthly_stats
+                WHERE org = ?
+                GROUP BY month_key
+                ORDER BY month_key DESC
+                LIMIT 6
+                """,
+                (org,),
+            ) or []
+        except Exception:
+            pass
+
+    # Current total open PRs.
+    open_pr_count = 0
+    if org:
+        try:
+            open_rows = await _d1_all(
+                db,
+                "SELECT SUM(open_prs) AS total FROM leaderboard_open_prs WHERE org = ?",
+                (org,),
+            )
+            open_pr_count = int(((open_rows or [{}])[0] or {}).get("total") or 0)
+        except Exception:
+            pass
+
+    # Top contributors for the current month.
+    mk = _month_key()
+    top_contributors: list = []
+    if org:
+        try:
+            top_contributors = await _d1_all(
+                db,
+                """
+                SELECT m.user_login,
+                       m.merged_prs,
+                       m.closed_prs,
+                       m.reviews,
+                       m.comments,
+                       COALESCE(o.open_prs, 0) AS open_prs,
+                       (COALESCE(o.open_prs, 0) * 1
+                        + m.merged_prs * 10
+                        + m.closed_prs * (-2)
+                        + m.reviews * 5
+                        + m.comments * 2) AS total
+                FROM leaderboard_monthly_stats m
+                LEFT JOIN leaderboard_open_prs o
+                       ON o.org = m.org AND o.user_login = m.user_login
+                WHERE m.org = ? AND m.month_key = ?
+                ORDER BY total DESC
+                LIMIT 15
+                """,
+                (org, mk),
+            ) or []
+        except Exception:
+            pass
+
+    return {
+        "org": org,
+        "all_orgs": all_orgs,
+        "daily_data": daily_data,
+        "totals": totals,
+        "monthly_data": monthly_data,
+        "open_pr_count": open_pr_count,
+        "top_contributors": top_contributors,
+        "current_month": mk,
+    }
+
+
+def _stats_html(data: dict) -> str:
+    """Render the full-stats page as an HTML string.
+
+    ``data`` is the dict returned by :func:`_get_stats_data`.
+    Charts are rendered client-side with Chart.js (loaded from CDN).
+    All chart data is embedded as JSON in a ``<script>`` tag.
+    """
+    org = data.get("org") or ""
+    all_orgs: list = data.get("all_orgs") or []
+    daily_data: list = data.get("daily_data") or []
+    totals: dict = data.get("totals") or {}
+    monthly_data: list = data.get("monthly_data") or []
+    top_contributors: list = data.get("top_contributors") or []
+    open_pr_count: int = int(data.get("open_pr_count") or 0)
+    current_month: str = data.get("current_month") or _month_key()
+    year = time.gmtime().tm_year
+
+    # --- org selector pill links ---
+    if all_orgs:
+        org_pills = " ".join(
+            f'<a href="/stats?org={o}" class="rounded-full border px-3 py-1 text-xs font-semibold transition '
+            + (
+                'border-[#E10101] bg-[#E10101] text-white'
+                if o == org
+                else 'border-[#E5E5E5] bg-white text-gray-600 hover:border-[#E10101] hover:text-[#E10101]'
+            )
+            + f'">{o}</a>'
+            for o in all_orgs
+        )
+    else:
+        org_pills = '<span class="text-sm text-gray-500">No data recorded yet.</span>'
+
+    # --- summary cards ---
+    def stat_card(icon: str, label: str, value: int, color: str = "#E10101") -> str:
+        return (
+            f'<article class="rounded-2xl border border-[#E5E5E5] bg-white p-5">'
+            f'<div class="mb-2 inline-flex h-10 w-10 items-center justify-center rounded-xl bg-[#feeae9]">'
+            f'<i class="fa-solid {icon} text-[#E10101]" aria-hidden="true"></i></div>'
+            f'<p class="text-xs font-semibold uppercase tracking-wide text-gray-500">{label}</p>'
+            f'<p class="mt-1 text-3xl font-extrabold text-[#111827]">{value:,}</p>'
+            f'<p class="mt-1 text-xs text-gray-400">last 30 days</p>'
+            f'</article>'
+        )
+
+    summary_cards = "".join([
+        stat_card("fa-code-pull-request", "PRs Opened", totals.get("prs_opened", 0)),
+        stat_card("fa-code-merge", "PRs Merged", totals.get("prs_merged", 0)),
+        stat_card("fa-circle-xmark", "PRs Closed", totals.get("prs_closed", 0)),
+        stat_card("fa-magnifying-glass-chart", "Reviews", totals.get("reviews", 0)),
+        stat_card("fa-comment-dots", "Comments", totals.get("comments", 0)),
+        stat_card("fa-code-branch", "Open PRs Now", open_pr_count),
+    ])
+
+    # --- top-contributors table rows ---
+    if top_contributors:
+        medals = ["🥇", "🥈", "🥉"]
+        contrib_rows = ""
+        for i, u in enumerate(top_contributors):
+            medal = medals[i] if i < 3 else f"#{i + 1}"
+            contrib_rows += (
+                f'<tr class="border-b border-[#E5E5E5] hover:bg-gray-50">'
+                f'<td class="px-4 py-3 text-sm font-semibold text-center">{medal}</td>'
+                f'<td class="px-4 py-3 text-sm font-semibold text-gray-800">'
+                f'<a href="https://github.com/{u.get("user_login","")}" target="_blank" rel="noopener" '
+                f'class="hover:text-[#E10101]">@{u.get("user_login","")}</a></td>'
+                f'<td class="px-4 py-3 text-sm text-center">{int(u.get("open_prs") or 0)}</td>'
+                f'<td class="px-4 py-3 text-sm text-center font-semibold text-emerald-700">{int(u.get("merged_prs") or 0)}</td>'
+                f'<td class="px-4 py-3 text-sm text-center text-red-600">{int(u.get("closed_prs") or 0)}</td>'
+                f'<td class="px-4 py-3 text-sm text-center">{int(u.get("reviews") or 0)}</td>'
+                f'<td class="px-4 py-3 text-sm text-center">{int(u.get("comments") or 0)}</td>'
+                f'<td class="px-4 py-3 text-sm text-center font-bold text-[#E10101]">{int(u.get("total") or 0)}</td>'
+                f'</tr>'
+            )
+    else:
+        contrib_rows = (
+            '<tr><td colspan="8" class="px-4 py-8 text-center text-sm text-gray-400">'
+            'No contributor data for this month yet.</td></tr>'
+        )
+
+    # --- monthly summary rows ---
+    if monthly_data:
+        monthly_rows_html = ""
+        for row in monthly_data:
+            monthly_rows_html += (
+                f'<tr class="border-b border-[#E5E5E5] hover:bg-gray-50">'
+                f'<td class="px-4 py-3 text-sm font-semibold">{row.get("month_key","")}</td>'
+                f'<td class="px-4 py-3 text-sm text-center font-semibold text-emerald-700">{int(row.get("merged_prs") or 0)}</td>'
+                f'<td class="px-4 py-3 text-sm text-center text-red-600">{int(row.get("closed_prs") or 0)}</td>'
+                f'<td class="px-4 py-3 text-sm text-center">{int(row.get("reviews") or 0)}</td>'
+                f'<td class="px-4 py-3 text-sm text-center">{int(row.get("comments") or 0)}</td>'
+                f'</tr>'
+            )
+    else:
+        monthly_rows_html = (
+            '<tr><td colspan="5" class="px-4 py-8 text-center text-sm text-gray-400">'
+            'No monthly data available yet.</td></tr>'
+        )
+
+    # --- chart data as JSON ---
+    chart_labels = json.dumps([d["date"][-5:] for d in daily_data])  # MM-DD
+    chart_labels_full = json.dumps([d["date"] for d in daily_data])
+    chart_opened = json.dumps([d["prs_opened"] for d in daily_data])
+    chart_merged = json.dumps([d["prs_merged"] for d in daily_data])
+    chart_closed = json.dumps([d["prs_closed"] for d in daily_data])
+    chart_reviews = json.dumps([d["reviews"] for d in daily_data])
+    chart_comments = json.dumps([d["comments"] for d in daily_data])
+
+    page_title = f"Stats — {org}" if org else "Stats — BLT-Pool"
+    no_org_banner = (
+        "" if org else
+        '<div class="rounded-xl border border-amber-200 bg-amber-50 p-4 text-sm text-amber-800">'
+        '<i class="fa-solid fa-triangle-exclamation mr-2"></i>'
+        'Select an organization above to view its stats.'
+        '</div>'
+    )
+
+    return f'''<!DOCTYPE html>
+<html lang="en" class="scroll-smooth">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="description" content="Full activity stats for OWASP BLT-Pool — PR activity, reviews, comments, and 30-day charts.">
+  <title>{page_title} | OWASP BLT</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"></script>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css" crossorigin="anonymous" referrerpolicy="no-referrer">
+  <script>
+    tailwind.config = {{
+      theme: {{
+        extend: {{
+          colors: {{
+            'blt-primary': '#E10101',
+            'blt-primary-hover': '#b91c1c',
+            'blt-border': '#E5E5E5'
+          }},
+          fontFamily: {{
+            sans: ['Plus Jakarta Sans', 'ui-sans-serif', 'system-ui', 'sans-serif']
+          }}
+        }}
+      }}
+    }}
+  </script>
+  <style>
+    body {{
+      background:
+        radial-gradient(circle at 0% 0%, rgba(225, 1, 1, 0.09), transparent 32%),
+        radial-gradient(circle at 95% 4%, rgba(225, 1, 1, 0.05), transparent 28%),
+        #f8fafc;
+    }}
+  </style>
+</head>
+<body class="min-h-screen font-sans text-gray-900 antialiased">
+
+  <header class="sticky top-0 z-40 border-b border-[#E5E5E5] bg-white/90 backdrop-blur">
+    <div class="mx-auto flex w-full max-w-7xl items-center justify-between px-4 py-4 sm:px-6 lg:px-8">
+      <a href="/" class="flex items-center gap-3" aria-label="BLT-Pool home">
+        <img src="/logo-sm.png" alt="OWASP BLT logo" class="h-10 w-10 rounded-xl border border-[#E5E5E5] bg-white object-contain p-1">
+        <div>
+          <p class="text-sm font-semibold uppercase tracking-wide text-gray-500">OWASP BLT</p>
+          <h1 class="text-lg font-extrabold text-[#111827]">BLT-Pool</h1>
+        </div>
+      </a>
+      <nav class="hidden items-center gap-1 rounded-xl border border-[#E5E5E5] bg-white p-1 md:flex" aria-label="Primary">
+        <a href="/" class="rounded-lg px-3 py-2 text-sm font-semibold text-gray-700 hover:bg-gray-50">Mentors</a>
+        <a href="/github-app" class="rounded-lg px-3 py-2 text-sm font-semibold text-gray-700 hover:bg-gray-50">GitHub App</a>
+        <a href="/stats" class="rounded-lg bg-[#feeae9] px-3 py-2 text-sm font-semibold text-[#E10101]">Stats</a>
+        <a href="https://owaspblt.org" target="_blank" rel="noopener" class="rounded-lg px-3 py-2 text-sm font-semibold text-gray-700 hover:bg-gray-50">
+          OWASP BLT <i class="fa-solid fa-arrow-up-right-from-square text-xs" aria-hidden="true"></i>
+        </a>
+      </nav>
+      <span role="status" class="inline-flex items-center gap-1.5 rounded-full border border-emerald-200 bg-emerald-50 px-3 py-1 text-xs font-semibold text-emerald-700">
+        <i class="fa-solid fa-circle text-[0.45rem]" aria-hidden="true"></i>
+        Operational
+      </span>
+    </div>
+  </header>
+
+  <main class="mx-auto w-full max-w-7xl space-y-10 px-4 py-10 sm:px-6 lg:px-8">
+
+    <!-- Page header -->
+    <section class="overflow-hidden rounded-3xl border border-[#E5E5E5] bg-white p-7 shadow-[0_14px_40px_rgba(225,1,1,0.10)] sm:p-10">
+      <div class="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
+        <div>
+          <span class="mb-3 inline-flex items-center gap-2 rounded-full border border-[#E5E5E5] bg-gray-50 px-3 py-1 text-xs font-semibold text-gray-700">
+            <i class="fa-solid fa-chart-line text-[#E10101]" aria-hidden="true"></i>
+            Activity Dashboard
+          </span>
+          <h2 class="text-3xl font-extrabold text-[#111827] sm:text-4xl">
+            Full Stats{f" — <span class='text-[#E10101]'>{org}</span>" if org else ""}
+          </h2>
+          <p class="mt-2 text-sm text-gray-500">30-day charts and all-time breakdowns for every tracked event.</p>
+        </div>
+        <div class="flex flex-wrap gap-2">
+          {org_pills}
+        </div>
+      </div>
+    </section>
+
+    {no_org_banner}
+
+    <!-- Summary cards -->
+    <section>
+      <h3 class="mb-4 text-xl font-bold text-[#111827]">30-Day Summary</h3>
+      <div class="grid grid-cols-2 gap-4 sm:grid-cols-3 xl:grid-cols-6">
+        {summary_cards}
+      </div>
+    </section>
+
+    <!-- 30-day activity chart -->
+    <section class="rounded-2xl border border-[#E5E5E5] bg-white p-6 sm:p-8">
+      <h3 class="mb-1 text-xl font-bold text-[#111827]">30-Day Activity</h3>
+      <p class="mb-5 text-sm text-gray-500">All tracked event types over the last 30 days.</p>
+      <div class="relative" style="height:320px">
+        <canvas id="activityChart" aria-label="30-day activity chart"></canvas>
+      </div>
+    </section>
+
+    <!-- PR activity chart -->
+    <section class="rounded-2xl border border-[#E5E5E5] bg-white p-6 sm:p-8">
+      <h3 class="mb-1 text-xl font-bold text-[#111827]">Pull Request Activity</h3>
+      <p class="mb-5 text-sm text-gray-500">PRs opened, merged, and closed each day.</p>
+      <div class="relative" style="height:280px">
+        <canvas id="prChart" aria-label="Pull request activity chart"></canvas>
+      </div>
+    </section>
+
+    <!-- Reviews & Comments chart -->
+    <section class="rounded-2xl border border-[#E5E5E5] bg-white p-6 sm:p-8">
+      <h3 class="mb-1 text-xl font-bold text-[#111827]">Reviews &amp; Comments</h3>
+      <p class="mb-5 text-sm text-gray-500">Daily code review activity and issue/PR comments.</p>
+      <div class="relative" style="height:260px">
+        <canvas id="engagementChart" aria-label="Reviews and comments chart"></canvas>
+      </div>
+    </section>
+
+    <!-- Top contributors -->
+    <section class="rounded-2xl border border-[#E5E5E5] bg-white p-6 sm:p-8">
+      <h3 class="mb-1 text-xl font-bold text-[#111827]">Top Contributors</h3>
+      <p class="mb-5 text-sm text-gray-500">Current month ({current_month}) — scored: open +1, merged +10, closed −2, review +5, comment +2.</p>
+      <div class="overflow-x-auto">
+        <table class="w-full text-left text-sm">
+          <thead>
+            <tr class="border-b-2 border-[#E5E5E5] text-xs font-semibold uppercase tracking-wide text-gray-500">
+              <th class="px-4 py-3 text-center">Rank</th>
+              <th class="px-4 py-3">Contributor</th>
+              <th class="px-4 py-3 text-center">Open PRs</th>
+              <th class="px-4 py-3 text-center">Merged</th>
+              <th class="px-4 py-3 text-center">Closed</th>
+              <th class="px-4 py-3 text-center">Reviews</th>
+              <th class="px-4 py-3 text-center">Comments</th>
+              <th class="px-4 py-3 text-center">Score</th>
+            </tr>
+          </thead>
+          <tbody>
+            {contrib_rows}
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- Monthly summary -->
+    <section class="rounded-2xl border border-[#E5E5E5] bg-white p-6 sm:p-8">
+      <h3 class="mb-1 text-xl font-bold text-[#111827]">Monthly Summary</h3>
+      <p class="mb-5 text-sm text-gray-500">Aggregated org-wide activity by month (last 6 months).</p>
+      <div class="overflow-x-auto">
+        <table class="w-full text-left text-sm">
+          <thead>
+            <tr class="border-b-2 border-[#E5E5E5] text-xs font-semibold uppercase tracking-wide text-gray-500">
+              <th class="px-4 py-3">Month</th>
+              <th class="px-4 py-3 text-center">Merged PRs</th>
+              <th class="px-4 py-3 text-center">Closed PRs</th>
+              <th class="px-4 py-3 text-center">Reviews</th>
+              <th class="px-4 py-3 text-center">Comments</th>
+            </tr>
+          </thead>
+          <tbody>
+            {monthly_rows_html}
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+  </main>
+
+  <footer class="border-t border-[#E5E5E5] bg-white">
+    <div class="mx-auto max-w-7xl px-4 py-6 text-center text-sm text-gray-600 sm:px-6 lg:px-8">
+      Built by the <a href="https://owaspblt.org" target="_blank" rel="noopener" class="text-red-600 hover:underline">OWASP BLT community</a>
+      <span aria-hidden="true"> • </span>
+      <a href="/" class="text-red-600 hover:underline">Mentors</a>
+      <span aria-hidden="true"> • </span>
+      <a href="/github-app" class="text-red-600 hover:underline">GitHub App</a>
+      <span aria-hidden="true"> • </span>
+      <a href="https://github.com/OWASP-BLT/BLT-Pool" target="_blank" rel="noopener" class="text-red-600 hover:underline">BLT-Pool Repo</a>
+      <p class="mt-2 text-xs text-gray-500">&copy; {year} OWASP Foundation. All rights reserved.</p>
+    </div>
+  </footer>
+
+  <script>
+    const LABELS = {chart_labels};
+    const LABELS_FULL = {chart_labels_full};
+    const OPENED = {chart_opened};
+    const MERGED = {chart_merged};
+    const CLOSED = {chart_closed};
+    const REVIEWS = {chart_reviews};
+    const COMMENTS = {chart_comments};
+
+    const tooltip = {{
+      mode: 'index',
+      intersect: false,
+    }};
+    const gridColor = 'rgba(0,0,0,0.05)';
+    const font = {{ family: 'Plus Jakarta Sans, ui-sans-serif, sans-serif', size: 12 }};
+
+    // Chart 1 — all metrics
+    new Chart(document.getElementById('activityChart'), {{
+      type: 'line',
+      data: {{
+        labels: LABELS,
+        datasets: [
+          {{ label: 'PRs Opened',  data: OPENED,   borderColor: '#3b82f6', backgroundColor: 'rgba(59,130,246,0.08)',  tension: 0.3, fill: true, pointRadius: 2 }},
+          {{ label: 'PRs Merged',  data: MERGED,   borderColor: '#10b981', backgroundColor: 'rgba(16,185,129,0.08)', tension: 0.3, fill: true, pointRadius: 2 }},
+          {{ label: 'PRs Closed',  data: CLOSED,   borderColor: '#e10101', backgroundColor: 'rgba(225,1,1,0.06)',    tension: 0.3, fill: true, pointRadius: 2 }},
+          {{ label: 'Reviews',     data: REVIEWS,  borderColor: '#f59e0b', backgroundColor: 'rgba(245,158,11,0.07)', tension: 0.3, fill: true, pointRadius: 2 }},
+          {{ label: 'Comments',    data: COMMENTS, borderColor: '#8b5cf6', backgroundColor: 'rgba(139,92,246,0.07)', tension: 0.3, fill: true, pointRadius: 2 }},
+        ],
+      }},
+      options: {{
+        responsive: true, maintainAspectRatio: false,
+        interaction: {{ mode: 'index', intersect: false }},
+        plugins: {{ legend: {{ labels: {{ font }} }}, tooltip }},
+        scales: {{
+          x: {{ grid: {{ color: gridColor }}, ticks: {{ font, maxRotation: 0 }} }},
+          y: {{ grid: {{ color: gridColor }}, ticks: {{ font, precision: 0 }}, beginAtZero: true }},
+        }},
+      }},
+    }});
+
+    // Chart 2 — PR bar chart
+    new Chart(document.getElementById('prChart'), {{
+      type: 'bar',
+      data: {{
+        labels: LABELS,
+        datasets: [
+          {{ label: 'Opened', data: OPENED, backgroundColor: 'rgba(59,130,246,0.7)',  borderRadius: 4 }},
+          {{ label: 'Merged', data: MERGED, backgroundColor: 'rgba(16,185,129,0.75)', borderRadius: 4 }},
+          {{ label: 'Closed', data: CLOSED, backgroundColor: 'rgba(225,1,1,0.65)',    borderRadius: 4 }},
+        ],
+      }},
+      options: {{
+        responsive: true, maintainAspectRatio: false,
+        interaction: {{ mode: 'index', intersect: false }},
+        plugins: {{ legend: {{ labels: {{ font }} }}, tooltip }},
+        scales: {{
+          x: {{ grid: {{ color: gridColor }}, ticks: {{ font, maxRotation: 0 }} }},
+          y: {{ grid: {{ color: gridColor }}, ticks: {{ font, precision: 0 }}, beginAtZero: true }},
+        }},
+      }},
+    }});
+
+    // Chart 3 — reviews & comments
+    new Chart(document.getElementById('engagementChart'), {{
+      type: 'bar',
+      data: {{
+        labels: LABELS,
+        datasets: [
+          {{ label: 'Reviews',  data: REVIEWS,  backgroundColor: 'rgba(245,158,11,0.75)',  borderRadius: 4 }},
+          {{ label: 'Comments', data: COMMENTS, backgroundColor: 'rgba(139,92,246,0.65)', borderRadius: 4 }},
+        ],
+      }},
+      options: {{
+        responsive: true, maintainAspectRatio: false,
+        interaction: {{ mode: 'index', intersect: false }},
+        plugins: {{ legend: {{ labels: {{ font }} }}, tooltip }},
+        scales: {{
+          x: {{ grid: {{ color: gridColor }}, ticks: {{ font, maxRotation: 0 }} }},
+          y: {{ grid: {{ color: gridColor }}, ticks: {{ font, precision: 0 }}, beginAtZero: true }},
+        }},
+      }},
+    }});
+  </script>
+
+</body>
+</html>'''
 
 
 async def _fetch_org_repos(org: str, token: str, limit: int = 10) -> list:
@@ -2966,6 +3549,7 @@ def _index_html() -> str:
       <nav class="hidden items-center gap-1 rounded-xl border border-[#E5E5E5] bg-white p-1 md:flex" aria-label="Primary">
         <a href="/" class="rounded-lg bg-[#feeae9] px-3 py-2 text-sm font-semibold text-[#E10101]">Mentors</a>
         <a href="/github-app" class="rounded-lg px-3 py-2 text-sm font-semibold text-gray-700 hover:bg-gray-50">GitHub App</a>
+        <a href="/stats" class="rounded-lg px-3 py-2 text-sm font-semibold text-gray-700 hover:bg-gray-50">Stats</a>
         <a href="https://owaspblt.org" target="_blank" rel="noopener" class="rounded-lg px-3 py-2 text-sm font-semibold text-gray-700 hover:bg-gray-50">
           OWASP BLT <i class="fa-solid fa-arrow-up-right-from-square text-xs" aria-hidden="true"></i>
         </a>
@@ -3090,6 +3674,8 @@ def _index_html() -> str:
       <span aria-hidden="true"> • </span>
       <a href="/github-app" class="text-red-600 hover:underline">GitHub App</a>
       <span aria-hidden="true"> • </span>
+      <a href="/stats" class="text-red-600 hover:underline">Stats</a>
+      <span aria-hidden="true"> • </span>
       <a href="https://github.com/OWASP-BLT/BLT-Pool" target="_blank" rel="noopener" class="text-red-600 hover:underline">BLT-Pool Repo</a>
       <p class="mt-2 text-xs text-gray-500">&copy; {year} OWASP Foundation. All rights reserved.</p>
     </div>
@@ -3148,6 +3734,31 @@ async def on_fetch(request, env) -> Response:
     # GitHub redirects here after a successful installation
     if method == "GET" and path == "/callback":
         return _html(_callback_html())
+
+    # Stats page — reads D1 for all tracked activity + 30-day charts.
+    if method == "GET" and path == "/stats":
+        db = _d1_binding(env)
+        org = urlparse(str(request.url)).query
+        # Parse ?org=... from the raw query string
+        org_param = ""
+        for part in (org or "").split("&"):
+            if part.startswith("org="):
+                org_param = part[4:].strip()
+                break
+        if db:
+            stats_data = await _get_stats_data(org_param, db)
+        else:
+            stats_data = {
+                "org": org_param,
+                "all_orgs": [],
+                "daily_data": [{"date": time.strftime("%Y-%m-%d", time.gmtime(int(time.time()) - i * 86400)), "prs_opened": 0, "prs_merged": 0, "prs_closed": 0, "reviews": 0, "comments": 0} for i in range(29, -1, -1)],
+                "totals": {"prs_opened": 0, "prs_merged": 0, "prs_closed": 0, "reviews": 0, "comments": 0},
+                "monthly_data": [],
+                "open_pr_count": 0,
+                "top_contributors": [],
+                "current_month": _month_key(),
+            }
+        return _html(_stats_html(stats_data))
 
     # Admin: reset corrupted leaderboard data for a given org/month so a fresh
     # backfill can re-populate it.  Requires ADMIN_SECRET env variable.
