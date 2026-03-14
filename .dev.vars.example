@@ -17,4 +17,4 @@ GITHUB_CLIENT_SECRET=
 BLT_API_URL=https://blt-api.owasp-blt.workers.dev
 
 # Optional: GitHub App slug (URL-friendly name shown in GitHub App URLs)
-GITHUB_APP_SLUG=blt-github-app
+GITHUB_APP_SLUG=blt-pool

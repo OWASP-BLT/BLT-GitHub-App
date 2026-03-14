@@ -1,4 +1,4 @@
-name = "blt-github-app"
+name = "blt-pool"
 main = "src/worker.py"
 compatibility_date = "2024-09-23"
 compatibility_flags = ["python_workers"]
@@ -24,7 +24,7 @@ BLT_API_URL = "https://github-app.owaspblt.org"
 # GitHub App slug — the URL-friendly name shown in GitHub App URLs.
 # Example: if your app lives at https://github.com/apps/my-blt-app
 # then set this to "my-blt-app".
-GITHUB_APP_SLUG = "blt-github-app"
+GITHUB_APP_SLUG = "blt-pool"
 
 # ---------------------------------------------------------------------------
 # Secrets — set these with:  wrangler secret put <NAME>

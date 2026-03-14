@@ -1,4 +1,4 @@
-name: BLT GitHub App
+name: BLT-Pool
 description: Integrates BLT services into GitHub — issue assignment, bug reporting, and PR management.
 url: https://owaspblt.org
 hook_attributes:
@@ -16,5 +16,7 @@ default_events:
   - issues
   - pull_request
   - pull_request_review
+  - pull_request_review_comment
+  - pull_request_review_thread
   - check_run
   - workflow_run
