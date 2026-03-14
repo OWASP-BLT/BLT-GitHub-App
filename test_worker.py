@@ -2688,6 +2688,88 @@ class TestCheckUnresolvedConversations(unittest.TestCase):
             f"Expected label with count 3, calls: {api_calls}",
         )
 
+    def test_sets_failure_commit_status_when_unresolved(self):
+        """A failure commit status should be posted when there are unresolved threads."""
+        threads = [{"isResolved": False}, {"isResolved": True}]
+        api_calls = []
+
+        async def _inner():
+            with patch.object(_worker, "fetch", new=AsyncMock(return_value=self._graphql_response(threads))):
+                with patch.object(
+                    _worker,
+                    "github_api",
+                    new=AsyncMock(side_effect=lambda *a, **kw: (api_calls.append(a), self._ok_response())[-1]),
+                ):
+                    await _worker.check_unresolved_conversations(self._payload(), "tok")
+
+        _run(_inner())
+        status_calls = [c for c in api_calls if c[0] == "POST" and "/statuses/" in c[1]]
+        self.assertEqual(len(status_calls), 1, f"Expected 1 POST to /statuses/, got {api_calls}")
+        body = status_calls[0][3]
+        self.assertEqual(body["state"], "failure")
+        self.assertEqual(body["context"], "BLT / unresolved-conversations")
+        self.assertIn("1 unresolved conversation", body["description"])
+
+    def test_sets_success_commit_status_when_all_resolved(self):
+        """A success commit status should be posted when all threads are resolved."""
+        threads = [{"isResolved": True}, {"isResolved": True}]
+        api_calls = []
+
+        async def _inner():
+            with patch.object(_worker, "fetch", new=AsyncMock(return_value=self._graphql_response(threads))):
+                with patch.object(
+                    _worker,
+                    "github_api",
+                    new=AsyncMock(side_effect=lambda *a, **kw: (api_calls.append(a), self._ok_response())[-1]),
+                ):
+                    await _worker.check_unresolved_conversations(self._payload(), "tok")
+
+        _run(_inner())
+        status_calls = [c for c in api_calls if c[0] == "POST" and "/statuses/" in c[1]]
+        self.assertEqual(len(status_calls), 1, f"Expected 1 POST to /statuses/, got {api_calls}")
+        body = status_calls[0][3]
+        self.assertEqual(body["state"], "success")
+        self.assertEqual(body["context"], "BLT / unresolved-conversations")
+
+    def test_no_commit_status_when_sha_missing(self):
+        """No commit status should be posted if the PR head SHA is absent."""
+        threads = [{"isResolved": False}]
+        api_calls = []
+        payload = self._payload()
+        del payload["pull_request"]["head"]
+
+        async def _inner():
+            with patch.object(_worker, "fetch", new=AsyncMock(return_value=self._graphql_response(threads))):
+                with patch.object(
+                    _worker,
+                    "github_api",
+                    new=AsyncMock(side_effect=lambda *a, **kw: (api_calls.append(a), self._ok_response())[-1]),
+                ):
+                    await _worker.check_unresolved_conversations(payload, "tok")
+
+        _run(_inner())
+        status_calls = [c for c in api_calls if c[0] == "POST" and "/statuses/" in c[1]]
+        self.assertEqual(len(status_calls), 0, f"Expected no status calls without SHA, got {status_calls}")
+
+    def test_failure_description_plural(self):
+        """Description should use plural 'conversations' for counts > 1."""
+        threads = [{"isResolved": False}, {"isResolved": False}]
+        api_calls = []
+
+        async def _inner():
+            with patch.object(_worker, "fetch", new=AsyncMock(return_value=self._graphql_response(threads))):
+                with patch.object(
+                    _worker,
+                    "github_api",
+                    new=AsyncMock(side_effect=lambda *a, **kw: (api_calls.append(a), self._ok_response())[-1]),
+                ):
+                    await _worker.check_unresolved_conversations(self._payload(), "tok")
+
+        _run(_inner())
+        status_calls = [c for c in api_calls if c[0] == "POST" and "/statuses/" in c[1]]
+        self.assertEqual(len(status_calls), 1)
+        self.assertIn("2 unresolved conversations", status_calls[0][3]["description"])
+
 
 # ---------------------------------------------------------------------------
 # label_pending_checks / handle_workflow_run / handle_check_run tests

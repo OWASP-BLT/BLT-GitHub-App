@@ -19,7 +19,7 @@ Environment variables / secrets (configure via ``wrangler.toml`` or
     GITHUB_APP_SLUG    — GitHub App slug used to build the install URL
     BLT_API_URL        — BLT API base URL (default: https://blt-api.owasp-blt.workers.dev)
     GITHUB_CLIENT_ID   — OAuth client ID (optional)
-    GITHUB_CLIENT_SECRET — OAuth client secret (optional)
+    GITHUB_CLIENT_SECRET — OAuth client secret (optional).
 """
 
 import base64
@@ -3248,7 +3248,7 @@ async def _ensure_label_exists(
             )
 
 async def check_unresolved_conversations(payload, token):
-    """Add label if PR has unresolved review conversations"""
+    """Add label and set commit status based on unresolved review conversations."""
     pr = payload.get("pull_request")
     if not pr:
         return
@@ -3256,6 +3256,7 @@ async def check_unresolved_conversations(payload, token):
     owner = payload["repository"]["owner"]["login"]
     repo = payload["repository"]["name"]
     number = pr["number"]
+    sha = pr.get("head", {}).get("sha")
 
     query = """
     query($owner: String!, $repo: String!, $number: Int!) {
@@ -3333,6 +3334,28 @@ async def check_unresolved_conversations(payload, token):
         token,
         {"labels": [label]},
     )
+
+    if sha:
+        if unresolved:
+            status_state = "failure"
+            status_description = (
+                f"{unresolved_count} unresolved conversation"
+                + ("s" if unresolved_count != 1 else "")
+            )
+        else:
+            status_state = "success"
+            status_description = "All conversations resolved"
+
+        await github_api(
+            "POST",
+            f"/repos/{owner}/{repo}/statuses/{sha}",
+            token,
+            {
+                "state": status_state,
+                "context": "BLT / unresolved-conversations",
+                "description": status_description,
+            },
+        )
 
 
 # ---------------------------------------------------------------------------
