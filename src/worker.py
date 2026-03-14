@@ -20,6 +20,7 @@ Environment variables / secrets (configure via ``wrangler.toml`` or
     BLT_API_URL        — BLT API base URL (default: https://blt-api.owasp-blt.workers.dev)
     GITHUB_CLIENT_ID   — OAuth client ID (optional)
     GITHUB_CLIENT_SECRET — OAuth client secret (optional)
+    ENABLE_DEPENDABOT_AUTO_APPROVAL — Enable/disable Dependabot auto-approval (default: true)
 """
 
 import base64
@@ -3707,6 +3708,151 @@ async def handle_pull_request_for_review(payload: dict, token: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Dependabot auto-approval
+# ---------------------------------------------------------------------------
+
+
+def _is_dependabot(user_login: str) -> bool:
+    """Check if a user is Dependabot."""
+    if not user_login:
+        return False
+    return user_login.lower() in ("dependabot[bot]", "dependabot-preview[bot]", "dependabot")
+
+
+def _is_dependabot_dependency_update(pr: dict) -> bool:
+    """Return True when the PR looks like a Dependabot dependency update."""
+    title = (pr.get("title") or "").strip().lower()
+    head_ref = ((pr.get("head") or {}).get("ref") or "").strip().lower()
+    body = (pr.get("body") or "").strip().lower()
+
+    # Dependabot branch refs are the strongest signal and ecosystem-agnostic.
+    if head_ref.startswith("dependabot/"):
+        return True
+
+    # Common Dependabot dependency update title forms.
+    title_looks_like_bump = (
+        (title.startswith("bump ") and " from " in title and " to " in title)
+        or title.startswith("build(deps)")
+        or title.startswith("chore(deps)")
+        or " deps: bump " in title
+    )
+
+    # Optional body signal frequently present in Dependabot PRs.
+    body_looks_like_dependabot = "dependabot will resolve this pr once" in body
+
+    return title_looks_like_bump or body_looks_like_dependabot
+
+
+async def handle_dependabot_pr(payload: dict, token: str, env=None) -> None:
+    """Auto-approve pull requests opened by Dependabot."""
+    # Check if feature is enabled
+    enabled = True
+    if env is not None:
+        enabled_val = str(getattr(env, "ENABLE_DEPENDABOT_AUTO_APPROVAL", "true")).strip().lower()
+        enabled = enabled_val not in ("false", "0", "no", "off")
+
+    if not enabled:
+        return
+
+    pr = payload.get("pull_request") or {}
+    repository = payload.get("repository") or {}
+    owner = ((repository.get("owner") or {}).get("login") or "")
+    repo = repository.get("name") or ""
+    pr_number = pr.get("number")
+    pr_author = (pr.get("user") or {}).get("login") or "<deleted>"
+    actor = ((payload.get("sender") or {}).get("login") or "")
+
+    if not owner or not repo or pr_number is None:
+        console.error(
+            f"[BLT] Skip auto-approval: missing repository/PR metadata "
+            f"repo={owner or '-'}/{repo or '-'} pr={pr_number if pr_number is not None else '-'} "
+            f"actor={actor or '-'} author={pr_author}"
+        )
+        return
+
+    if not _is_dependabot(actor):
+        console.log(
+            f"[BLT] Skip auto-approval: non-Dependabot sender "
+            f"repo={owner}/{repo} pr={pr_number} actor={actor or '-'} author={pr_author}"
+        )
+        return
+
+    pr_state = (pr.get("state") or "").strip().lower()
+    if pr_state != "open":
+        console.log(
+            f"[BLT] Skip auto-approval: PR not open "
+            f"repo={owner}/{repo} pr={pr_number} actor={actor or '-'} "
+            f"author={pr_author} state={pr_state or '-'}"
+        )
+        return
+
+    if not _is_dependabot(pr_author):
+        console.log(
+            f"[BLT] Skip auto-approval: non-Dependabot author "
+            f"repo={owner}/{repo} pr={pr_number} actor={actor or '-'} author={pr_author}"
+        )
+        return
+
+    if pr.get("draft"):
+        console.log(
+            f"[BLT] Skip auto-approval: draft PR "
+            f"repo={owner}/{repo} pr={pr_number} actor={actor or '-'} author={pr_author}"
+        )
+        return
+
+    head_repo = (pr.get("head") or {}).get("repo")
+    base_repo = (pr.get("base") or {}).get("repo")
+    if not head_repo or not base_repo:
+        console.log(
+            f"[BLT] Skip auto-approval: missing head/base repo in payload "
+            f"repo={owner}/{repo} pr={pr_number} actor={actor or '-'} author={pr_author}"
+        )
+        return
+
+    head_repo_full = head_repo.get("full_name") or ""
+    base_repo_full = base_repo.get("full_name") or ""
+    if head_repo_full != base_repo_full:
+        console.log(
+            f"[BLT] Skip auto-approval: fork-based PR "
+            f"repo={owner}/{repo} pr={pr_number} actor={actor or '-'} author={pr_author} "
+            f"head_repo={head_repo_full} base_repo={base_repo_full}"
+        )
+        return
+
+    if not _is_dependabot_dependency_update(pr):
+        console.log(
+            f"[BLT] Skip auto-approval: not a dependency update "
+            f"repo={owner}/{repo} pr={pr_number} actor={actor or '-'} author={pr_author} "
+            f"title={pr.get('title') or '-'}"
+        )
+        return
+
+    # Approve the PR using GitHub Reviews API
+    resp = await github_api(
+        "POST",
+        f"/repos/{owner}/{repo}/pulls/{pr_number}/reviews",
+        token,
+        {
+            "event": "APPROVE",
+            "body": "🤖 Auto-approved: Dependabot dependency update."
+        }
+    )
+
+    if resp.status in (200, 201):
+        console.log(
+            f"[BLT] Auto-approved Dependabot PR "
+            f"repo={owner}/{repo} pr={pr_number} actor={actor or '-'} author={pr_author}"
+        )
+    else:
+        error_text = await resp.text() if resp.status >= 400 else ""
+        console.error(
+            f"[BLT] Auto-approval failed "
+            f"repo={owner}/{repo} pr={pr_number} actor={actor or '-'} author={pr_author} "
+            f"status={resp.status} error={error_text}"
+        )
+
+
+# ---------------------------------------------------------------------------
 # Webhook dispatcher
 # ---------------------------------------------------------------------------
 
@@ -3785,8 +3931,10 @@ async def handle_webhook(request, env) -> Response:
         elif event == "pull_request":
             if action == "opened":
                 await handle_pull_request_opened(payload, token, env)
+                await handle_dependabot_pr(payload, token, env)
                 await handle_pull_request_for_review(payload, token)
             elif action == "synchronize" or action == "reopened":
+                await handle_dependabot_pr(payload, token, env)
                 await handle_pull_request_for_review(payload, token)
             elif action == "closed":
                 await handle_pull_request_closed(payload, token, env)
