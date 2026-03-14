@@ -4063,5 +4063,131 @@ class TestIndexHtml(unittest.TestCase):
         self.assertNotIn("None", html)
 
 
+# ---------------------------------------------------------------------------
+# Tests for .github/scripts/add_mentor.py
+# ---------------------------------------------------------------------------
+
+import importlib.util as _ilu
+
+_am_path = pathlib.Path(__file__).parent / ".github" / "scripts" / "add_mentor.py"
+_am_spec = _ilu.spec_from_file_location("add_mentor", _am_path)
+_am = _ilu.module_from_spec(_am_spec)
+_am_spec.loader.exec_module(_am)
+
+
+class TestAddMentorParseBody(unittest.TestCase):
+    """parse_body — field extraction from issue body."""
+
+    _FULL_BODY = (
+        "## Mentor Application\n\n"
+        "- **Name**: Jane Doe\n"
+        "- **GitHub Username**: @janedoe\n"
+        "- **Slack Username**: janedoe\n"
+        "- **Specialties**: frontend, python\n"
+        "- **Max Mentees**: 3\n"
+        "- **Timezone**: UTC+5:30\n"
+        "- **Referred By**: @alice\n"
+    )
+
+    def test_slack_username_parsed(self):
+        fields = _am.parse_body(self._FULL_BODY)
+        self.assertEqual(fields["slack_username"], "janedoe")
+
+    def test_slack_leading_at_stripped(self):
+        body = self._FULL_BODY.replace("- **Slack Username**: janedoe", "- **Slack Username**: @janedoe")
+        fields = _am.parse_body(body)
+        self.assertEqual(fields["slack_username"], "janedoe")
+
+    def test_slack_missing_returns_empty(self):
+        body = "\n".join(
+            line for line in self._FULL_BODY.splitlines() if "Slack Username" not in line
+        )
+        fields = _am.parse_body(body)
+        self.assertEqual(fields["slack_username"], "")
+
+    def test_slack_null_placeholder_returns_empty(self):
+        body = self._FULL_BODY.replace("- **Slack Username**: janedoe", "- **Slack Username**: _not specified_")
+        fields = _am.parse_body(body)
+        self.assertEqual(fields["slack_username"], "")
+
+
+class TestAddMentorBuildEntry(unittest.TestCase):
+    """build_entry — YAML output always includes slack_username."""
+
+    def _fields(self, **overrides):
+        base = {
+            "github_username": "janedoe",
+            "name": "Jane Doe",
+            "slack_username": "janedoe",
+            "specialties": [],
+            "max_mentees": 3,
+            "timezone": "",
+            "referred_by": "",
+        }
+        base.update(overrides)
+        return base
+
+    def test_slack_username_always_in_entry(self):
+        entry = _am.build_entry(self._fields(slack_username="janedoe"))
+        self.assertIn("slack_username:", entry)
+        self.assertIn("janedoe", entry)
+
+    def test_slack_username_empty_string_still_written(self):
+        # build_entry is only called after validation, but we test it handles "" gracefully
+        entry = _am.build_entry(self._fields(slack_username=""))
+        self.assertIn("slack_username:", entry)
+
+
+class TestAddMentorSlackRequired(unittest.TestCase):
+    """main() — slack_username is required; missing value exits with code 1."""
+
+    _BASE_BODY = (
+        "## Mentor Application\n\n"
+        "- **Name**: Jane Doe\n"
+        "- **GitHub Username**: @janedoe\n"
+        "- **Slack Username**: janedoe\n"
+    )
+
+    def _run_main(self, body: str, mentors_yml: str = "mentors:\n"):
+        import os
+        import tempfile
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".yml", delete=False) as f:
+            f.write(mentors_yml)
+            tmp_path = f.name
+        try:
+            env = {"ISSUE_BODY": body, "MENTORS_YML": tmp_path}
+            old_env = {k: os.environ.get(k) for k in env}
+            os.environ.update(env)
+            try:
+                _am.main()
+                return 0
+            except SystemExit as exc:
+                return exc.code
+            finally:
+                for k, v in old_env.items():
+                    if v is None:
+                        os.environ.pop(k, None)
+                    else:
+                        os.environ[k] = v
+        finally:
+            os.unlink(tmp_path)
+
+    def test_slack_present_succeeds(self):
+        code = self._run_main(self._BASE_BODY)
+        self.assertEqual(code, 0)
+
+    def test_slack_missing_exits_nonzero(self):
+        body = "\n".join(
+            line for line in self._BASE_BODY.splitlines() if "Slack Username" not in line
+        )
+        code = self._run_main(body)
+        self.assertNotEqual(code, 0)
+
+    def test_slack_placeholder_exits_nonzero(self):
+        body = self._BASE_BODY.replace("- **Slack Username**: janedoe", "- **Slack Username**: _not specified_")
+        code = self._run_main(body)
+        self.assertNotEqual(code, 0)
+
+
 if __name__ == "__main__":
     unittest.main()

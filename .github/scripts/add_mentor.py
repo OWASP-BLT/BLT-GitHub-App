@@ -6,6 +6,7 @@ Expected issue body format (produced by the homepage form or the issue template)
 
     - **Name**: Jane Doe
     - **GitHub Username**: @janedoe
+    - **Slack Username**: janedoe
     - **Specialties**: frontend, python
     - **Max Mentees**: 3
     - **Timezone**: UTC+5:30
@@ -127,9 +128,8 @@ def build_entry(fields: dict) -> str:
     lines = [
         f'  - github_username: {_yaml_quote(fields["github_username"])}',
         f'    name: {_yaml_quote(fields["name"])}',
+        f'    slack_username: {_yaml_quote(fields["slack_username"])}',
     ]
-    if fields.get("slack_username"):
-        lines.append(f'    slack_username: {_yaml_quote(fields["slack_username"])}')
     if fields["specialties"]:
         lines.append("    specialties:")
         for tag in fields["specialties"]:
@@ -170,6 +170,10 @@ def main() -> None:
         )
         sys.exit(1)
 
+    if not fields["slack_username"]:
+        print("ERROR: Could not parse 'Slack Username' from the issue body.", file=sys.stderr)
+        sys.exit(1)
+
     mentors_path = os.environ.get("MENTORS_YML", ".github/mentors.yml")
 
     try:
@@ -183,7 +187,7 @@ def main() -> None:
     # rather than doing a raw substring search (which causes false positives).
     try:
         existing = yaml.safe_load(content) or {}
-        existing_mentors = existing.get("mentors", []) if isinstance(existing, dict) else []
+        existing_mentors = (existing.get("mentors") or []) if isinstance(existing, dict) else []
     except yaml.YAMLError:
         existing_mentors = []
     username_lower = fields["github_username"].lower()
