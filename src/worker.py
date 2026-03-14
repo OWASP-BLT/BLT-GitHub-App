@@ -4427,13 +4427,11 @@ def _handle_mentors_list(request) -> Response:
             {
                 "name": m.get("name", ""),
                 "github_username": m.get("github_username", "") or None,
-                "slack_username": m.get("slack_username", "") or None,
-                "project": m.get("project") or None,
-                "mentee": m.get("mentee") or None,
                 "status": m.get("status", "available"),
                 "specialties": m.get("specialties", []),
                 "max_mentees": m.get("max_mentees", 3),
                 "active": m.get("active", True),
+                "timezone": m.get("timezone") or None,
             }
             for m in mentors
         ],
@@ -4459,10 +4457,11 @@ def _handle_mentor_detail(username: str) -> Response:
     return _json({
         "name": mentor.get("name", ""),
         "github_username": mentor.get("github_username", "") or None,
-        "slack_username": mentor.get("slack_username", "") or None,
-        "project": mentor.get("project") or None,
-        "mentee": mentor.get("mentee") or None,
         "status": mentor.get("status", "available"),
+        "specialties": mentor.get("specialties", []),
+        "max_mentees": mentor.get("max_mentees", 3),
+        "active": mentor.get("active", True),
+        "timezone": mentor.get("timezone") or None,
     })
 
 # ---------------------------------------------------------------------------
