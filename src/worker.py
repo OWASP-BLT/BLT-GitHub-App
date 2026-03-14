@@ -46,6 +46,11 @@ LEADERBOARD_COMMAND = "/leaderboard"
 MAX_ASSIGNEES = 1
 ASSIGNMENT_DURATION_HOURS = 8
 BUG_LABELS = {"bug", "vulnerability", "security"}
+STALE_REVIEW_DISMISS_MESSAGE = (
+    "\U0001f504 New commits have been pushed. "
+    "Dismissing this review as the author is addressing feedback. "
+    "Please re-review when ready."
+)
 
 # ---------------------------------------------------------------------------
 # Mentor pool — slash commands and label names
@@ -3706,6 +3711,67 @@ async def handle_pull_request_for_review(payload: dict, token: str) -> None:
     await _try_label_pending_checks(owner, repo, pr, token)
 
 
+async def dismiss_stale_reviews(owner: str, repo: str, pr_number: int, token: str) -> None:
+    """Dismiss any 'CHANGES_REQUESTED' reviews when new commits are pushed to a PR.
+
+    Paginates through all reviews, resolves the latest state per reviewer, and
+    dismisses every review still in the CHANGES_REQUESTED state so that
+    reviewers are prompted to re-review the updated code.
+    """
+    # Collect all reviews with pagination
+    all_reviews = []
+    page = 1
+    while True:
+        resp = await github_api(
+            "GET",
+            f"/repos/{owner}/{repo}/pulls/{pr_number}/reviews?per_page=100&page={page}",
+            token,
+        )
+        if resp.status != 200:
+            console.error(f"[BLT] Failed to fetch reviews for PR #{pr_number}: {resp.status}")
+            return
+        reviews = json.loads(await resp.text())
+        if not reviews:
+            break
+        all_reviews.extend(reviews)
+        page += 1
+
+    # Build a map of the most recent review per reviewer
+    latest_by_user: dict = {}
+    for review in all_reviews:
+        login = (review.get("user") or {}).get("login", "")
+        if not login:
+            continue
+        existing = latest_by_user.get(login)
+        submitted_at = review.get("submitted_at") or ""
+        existing_at = (existing or {}).get("submitted_at") or ""
+        if not existing or submitted_at > existing_at:
+            latest_by_user[login] = review
+
+    # Keep only reviews that are still in CHANGES_REQUESTED state
+    change_requests = [r for r in latest_by_user.values() if r.get("state") == "CHANGES_REQUESTED"]
+    if not change_requests:
+        console.log(f"[BLT] No 'changes requested' reviews to dismiss for PR #{pr_number}")
+        return
+
+    console.log(f"[BLT] Dismissing {len(change_requests)} 'changes requested' review(s) for PR #{pr_number}")
+    for review in change_requests:
+        review_id = review.get("id")
+        reviewer = (review.get("user") or {}).get("login", "")
+        resp = await github_api(
+            "PUT",
+            f"/repos/{owner}/{repo}/pulls/{pr_number}/reviews/{review_id}/dismissals",
+            token,
+            {"message": STALE_REVIEW_DISMISS_MESSAGE},
+        )
+        if resp.status == 200:
+            console.log(f"[BLT] Dismissed review #{review_id} from @{reviewer} on PR #{pr_number}")
+        else:
+            console.error(
+                f"[BLT] Failed to dismiss review #{review_id} on PR #{pr_number}: {resp.status}"
+            )
+
+
 # ---------------------------------------------------------------------------
 # Webhook dispatcher
 # ---------------------------------------------------------------------------
@@ -3786,7 +3852,13 @@ async def handle_webhook(request, env) -> Response:
             if action == "opened":
                 await handle_pull_request_opened(payload, token, env)
                 await handle_pull_request_for_review(payload, token)
-            elif action == "synchronize" or action == "reopened":
+            elif action == "synchronize":
+                pr = payload["pull_request"]
+                owner = payload["repository"]["owner"]["login"]
+                repo_name = payload["repository"]["name"]
+                await dismiss_stale_reviews(owner, repo_name, pr["number"], token)
+                await handle_pull_request_for_review(payload, token)
+            elif action == "reopened":
                 await handle_pull_request_for_review(payload, token)
             elif action == "closed":
                 await handle_pull_request_closed(payload, token, env)

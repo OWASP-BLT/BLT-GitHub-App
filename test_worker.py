@@ -2571,6 +2571,154 @@ class TestLabelPendingChecks(unittest.TestCase):
         self.assertIs(_worker.check_workflows_awaiting_approval, _worker.label_pending_checks)
 
 
+# ---------------------------------------------------------------------------
+# dismiss_stale_reviews tests
+# ---------------------------------------------------------------------------
+
+
+class TestDismissStaleReviews(unittest.TestCase):
+    """dismiss_stale_reviews — dismisses CHANGES_REQUESTED reviews on new commits."""
+
+    def _reviews_response(self, reviews):
+        resp = MagicMock()
+        resp.status = 200
+        resp.text = AsyncMock(return_value=json.dumps(reviews))
+        return resp
+
+    def _ok_response(self):
+        resp = MagicMock()
+        resp.status = 200
+        resp.text = AsyncMock(return_value="{}")
+        return resp
+
+    def _make_review(self, review_id, login, state, submitted_at="2024-01-01T00:00:00Z"):
+        return {
+            "id": review_id,
+            "user": {"login": login},
+            "state": state,
+            "submitted_at": submitted_at,
+        }
+
+    def test_dismisses_changes_requested_reviews(self):
+        """Should PUT to dismissals endpoint for each CHANGES_REQUESTED review."""
+        reviews = [self._make_review(101, "alice", "CHANGES_REQUESTED")]
+        api_calls = []
+
+        async def mock_api(*args, **kwargs):
+            api_calls.append((args, kwargs))
+            if args[0] == "GET":
+                return self._reviews_response(reviews if args[1].endswith("page=1") else [])
+            return self._ok_response()
+
+        async def _inner():
+            with patch.object(_worker, "github_api", new=AsyncMock(side_effect=mock_api)):
+                await _worker.dismiss_stale_reviews("acme", "widgets", 7, "tok")
+
+        _run(_inner())
+        dismiss_calls = [c for c in api_calls if c[0][0] == "PUT" and "dismissals" in c[0][1]]
+        self.assertEqual(len(dismiss_calls), 1, f"Expected 1 dismissal PUT, got {api_calls}")
+        self.assertIn("/reviews/101/dismissals", dismiss_calls[0][0][1])
+
+    def test_skips_approved_reviews(self):
+        """Should NOT dismiss reviews with state APPROVED."""
+        reviews = [self._make_review(200, "bob", "APPROVED")]
+        api_calls = []
+
+        async def mock_api(*args, **kwargs):
+            api_calls.append(args)
+            if args[0] == "GET":
+                return self._reviews_response(reviews if args[1].endswith("page=1") else [])
+            return self._ok_response()
+
+        async def _inner():
+            with patch.object(_worker, "github_api", new=AsyncMock(side_effect=mock_api)):
+                await _worker.dismiss_stale_reviews("acme", "widgets", 8, "tok")
+
+        _run(_inner())
+        dismiss_calls = [c for c in api_calls if c[0] == "PUT" and "dismissals" in c[1]]
+        self.assertEqual(len(dismiss_calls), 0, "Should not dismiss APPROVED reviews")
+
+    def test_uses_latest_review_state_per_reviewer(self):
+        """When a reviewer has multiple reviews, only the latest state should count."""
+        reviews = [
+            self._make_review(301, "carol", "CHANGES_REQUESTED", "2024-01-01T00:00:00Z"),
+            self._make_review(302, "carol", "APPROVED", "2024-01-02T00:00:00Z"),
+        ]
+        api_calls = []
+
+        async def mock_api(*args, **kwargs):
+            api_calls.append(args)
+            if args[0] == "GET":
+                return self._reviews_response(reviews if args[1].endswith("page=1") else [])
+            return self._ok_response()
+
+        async def _inner():
+            with patch.object(_worker, "github_api", new=AsyncMock(side_effect=mock_api)):
+                await _worker.dismiss_stale_reviews("acme", "widgets", 9, "tok")
+
+        _run(_inner())
+        dismiss_calls = [c for c in api_calls if c[0] == "PUT" and "dismissals" in c[1]]
+        self.assertEqual(len(dismiss_calls), 0, "Latest review is APPROVED, should not dismiss")
+
+    def test_dismisses_only_latest_changes_requested(self):
+        """When reviewer's latest review is CHANGES_REQUESTED, it should be dismissed."""
+        reviews = [
+            self._make_review(401, "dave", "APPROVED", "2024-01-01T00:00:00Z"),
+            self._make_review(402, "dave", "CHANGES_REQUESTED", "2024-01-02T00:00:00Z"),
+        ]
+        api_calls = []
+
+        async def mock_api(*args, **kwargs):
+            api_calls.append((args, kwargs))
+            if args[0] == "GET":
+                return self._reviews_response(reviews if args[1].endswith("page=1") else [])
+            return self._ok_response()
+
+        async def _inner():
+            with patch.object(_worker, "github_api", new=AsyncMock(side_effect=mock_api)):
+                await _worker.dismiss_stale_reviews("acme", "widgets", 10, "tok")
+
+        _run(_inner())
+        dismiss_calls = [c for c in api_calls if c[0][0] == "PUT" and "dismissals" in c[0][1]]
+        self.assertEqual(len(dismiss_calls), 1, "Should dismiss when latest review is CHANGES_REQUESTED")
+        self.assertIn("/reviews/402/dismissals", dismiss_calls[0][0][1])
+
+    def test_no_dismissals_when_no_reviews(self):
+        """Should make no PUT calls when there are no reviews at all."""
+        api_calls = []
+
+        async def mock_api(*args, **kwargs):
+            api_calls.append(args)
+            return self._reviews_response([])
+
+        async def _inner():
+            with patch.object(_worker, "github_api", new=AsyncMock(side_effect=mock_api)):
+                await _worker.dismiss_stale_reviews("acme", "widgets", 11, "tok")
+
+        _run(_inner())
+        dismiss_calls = [c for c in api_calls if c[0] == "PUT" and "dismissals" in c[1]]
+        self.assertEqual(len(dismiss_calls), 0)
+
+    def test_graceful_on_fetch_error(self):
+        """Should return early without crashing when the reviews API returns an error."""
+        fail_resp = MagicMock()
+        fail_resp.status = 500
+        fail_resp.text = AsyncMock(return_value="{}")
+        api_calls = []
+
+        async def mock_api(*args, **kwargs):
+            api_calls.append(args)
+            return fail_resp
+
+        async def _inner():
+            with patch.object(_worker, "github_api", new=AsyncMock(side_effect=mock_api)):
+                await _worker.dismiss_stale_reviews("acme", "widgets", 12, "tok")
+
+        _run(_inner())
+        dismiss_calls = [c for c in api_calls if c[0] == "PUT"]
+        self.assertEqual(len(dismiss_calls), 0, "Should not attempt dismissal after fetch failure")
+
+
 class TestHandleWorkflowRun(unittest.TestCase):
     """handle_workflow_run — routes workflow_run events to per-PR label updates."""
 
