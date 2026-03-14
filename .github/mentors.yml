@@ -12,6 +12,7 @@
 #   max_mentees      - Maximum concurrent open mentee issues (default: 3)
 #   active           - Whether this mentor accepts new assignments (default: true)
 #   timezone         - Optional timezone hint (e.g. "UTC+5:30")
+#   referred_by      - Optional GitHub username of the mentor referrer
 #
 # To pause yourself from receiving new assignments:
 #   1. Open a PR setting active: false for your entry.
